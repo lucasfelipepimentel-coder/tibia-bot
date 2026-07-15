@@ -100,13 +100,11 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
 
       // Update online list table every 5 minutes for killer level lookups
       if (now.isAfter(onlineListTableUpdateTimer.plusMinutes(5))) {
-        logger.info(s"Updating online list table for world: $world with ${onlineWithVocLvlAndDuration.size} players")
         onlineListTable.clear()
         onlineWithVocLvlAndDuration.foreach { player =>
           onlineListTable.put(player.name.toLowerCase, OnlineListEntry(player.name, player.level, now))
         }
         onlineListTableUpdateTimer = now
-        logger.info(s"Online list table updated with ${onlineListTable.size} entries")
       }
 
       // Remove existing online chars from the list...
@@ -1348,11 +1346,8 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
     // Check the dedicated online list table for the killer
     val onlineLevel = onlineListTable.get(killerName.toLowerCase).map(_.level)
     if (onlineLevel.isDefined) {
-      logger.info(s"Found level ${onlineLevel.get} for $killerName in online list table")
       onlineLevel
     } else {
-      logger.info(s"$killerName not found in online list table - killer may be offline, trying TibiaData API")
-
       // Fallback to TibiaData API
       try {
         val characterResponse = Await.result(tibiaDataClient.getKillerFallback(killerName), Duration(10, "seconds"))
