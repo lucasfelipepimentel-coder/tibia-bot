@@ -7,18 +7,18 @@ import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEve
 object ChannelCommands {
 
   def setup(event: SlashCommandInteractionEvent): Unit = {
-    val embed = BotApp.createChannels(event)
+    val embed = BotApp.channelService.createChannels(event)
     event.getHook.sendMessageEmbeds(embed).queue()
   }
 
   def remove(event: SlashCommandInteractionEvent): Unit = {
-    val embed = BotApp.removeChannels(event)
+    val embed = BotApp.channelService.removeChannels(event)
     event.getHook.sendMessageEmbeds(embed).queue()
   }
 
   def repair(event: SlashCommandInteractionEvent): Unit = {
     val worldOption = Options.of(event).getOrElse("world", "")
-    val embed = BotApp.repairChannel(event, worldOption)
+    val embed = BotApp.channelService.repairChannel(event, worldOption)
     event.getHook.sendMessageEmbeds(embed).queue()
   }
 }

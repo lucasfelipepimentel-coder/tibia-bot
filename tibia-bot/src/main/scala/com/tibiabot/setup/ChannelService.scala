@@ -2,25 +2,966 @@ package com.tibiabot.setup
 
 import com.tibiabot.Config
 import com.tibiabot.app.StreamSupervisor
-import com.tibiabot.persistence.SchemaInitializer
+import com.tibiabot.boosted.BoostedService
+import com.tibiabot.domain.{Discords, Worlds}
+import com.tibiabot.persistence.{DiscordConfigRepository, SchemaInitializer, WorldConfigRepository}
+import com.tibiabot.presentation.Embeds.BrandColor
+import com.tibiabot.state.StreamState
 import com.typesafe.scalalogging.StrictLogging
-import net.dv8tion.jda.api.EmbedBuilder
+import net.dv8tion.jda.api.entities.channel.attribute.IPermissionContainer
+import net.dv8tion.jda.api.entities.channel.concrete.TextChannel
+import net.dv8tion.jda.api.entities.emoji.Emoji
+import net.dv8tion.jda.api.entities.{Guild, Message, MessageEmbed, Role}
 import net.dv8tion.jda.api.events.guild.{GuildJoinEvent, GuildLeaveEvent}
+import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent
+import net.dv8tion.jda.api.interactions.components.buttons.Button
+import net.dv8tion.jda.api.{EmbedBuilder, Permission}
+
+import java.awt.Color
+import java.time.ZonedDateTime
+import scala.collection.mutable.ListBuffer
+import scala.concurrent.{ExecutionContextExecutor, Future}
+import scala.jdk.CollectionConverters._
 
 /** Per-guild channel/role setup lifecycle, being extracted from BotApp
- *  incrementally. Currently holds the guild-join/leave handlers; the
- *  channel-create/repair/remove operations will move here as their BotApp
- *  dependencies are untangled.
+ *  incrementally. Currently holds the guild-join/leave handlers and
+ *  `createChannels` (`/setup`); `repairChannel`/`removeChannels` will move
+ *  here next. State mutation for join/leave stays in BotApp via the
+ *  `forgetGuild` callback; `createChannels` reads/writes `streamState`
+ *  directly since it now lives here.
  *
  *  @param forgetGuild         drops a guild's in-memory state (worldsData/discordsData)
  *  @param sharedConfigGuilds  guilds whose database is shared with another bot, so it must NOT be dropped on leave
+ *  @param startBot            BotApp's bootstrap routine (touches nearly every state map); kept as a callback rather than moved/duplicated
+ *  @param serverSaveExtraEmbeds the Rashid/Dream Courts/Drome embeds appended after the boosted embeds; stays in BotApp (Dream Scar/Drome state), passed as a callback
  */
 final class ChannelService(
   streamSupervisor: StreamSupervisor,
   schemaInitializer: SchemaInitializer,
+  worldConfigRepository: WorldConfigRepository,
+  discordConfigRepository: DiscordConfigRepository,
+  streamState: StreamState,
+  boostedService: BoostedService,
+  botUser: String,
+  startBot: (Option[Guild], Option[String]) => Unit,
+  serverSaveExtraEmbeds: String => List[MessageEmbed],
   forgetGuild: String => Unit,
   sharedConfigGuilds: Set[String]
-) extends StrictLogging {
+)(implicit ex: ExecutionContextExecutor) extends StrictLogging {
+
+  private def createConfigDatabase(guild: Guild): Unit = schemaInitializer.initGuild(guild.getId, guild.getName)
+
+  private def worldConfig(guild: Guild): List[Worlds] =
+    worldConfigRepository.listWorlds(guild.getId)
+
+  private def worldCreateConfig(guild: Guild, world: String, alliesChannel: String, enemiesChannel: String, neutralsChannels: String, levelsChannel: String, deathsChannel: String, category: String, fullblessRole: String, nemesisRole: String, allyPkRole: String, masslogRole: String, fullblessChannel: String, nemesisChannel: String, activityChannel: String): Unit =
+    worldConfigRepository.createWorld(guild.getId, world, alliesChannel, enemiesChannel, neutralsChannels, levelsChannel, deathsChannel, category, fullblessRole, nemesisRole, allyPkRole, masslogRole, fullblessChannel, nemesisChannel, activityChannel)
+
+  private def worldRetrieveConfig(guild: Guild, world: String): Map[String, String] =
+    worldConfigRepository.retrieveWorld(guild.getId, world)
+
+  private def discordRetrieveConfig(guild: Guild): Map[String, String] =
+    discordConfigRepository.getConfig(guild.getId)
+
+  private def discordCreateConfig(guild: Guild, guildName: String, guildOwner: String, adminCategory: String, adminChannel: String, boostedChannel: String, boostedMessageId: String, created: ZonedDateTime): Unit =
+    discordConfigRepository.create(guild.getId, guildName, guildOwner, adminCategory, adminChannel, boostedChannel, boostedMessageId, created)
+
+  private def discordUpdateConfig(guild: Guild, adminCategory: String, adminChannel: String, boostedChannel: String, boostedMessage: String, lastWorld: String): Unit =
+    discordConfigRepository.update(guild.getId, adminCategory, adminChannel, boostedChannel, boostedMessage, lastWorld)
+
+  private def worldRepairConfig(guild: Guild, world: String, tableName: String, newValue: String): Unit =
+    worldConfigRepository.updateWorldString(guild.getId, world, tableName, newValue)
+
+  private def worldRemoveConfig(guild: Guild, query: String): Unit =
+    worldConfigRepository.removeWorld(guild.getId, query)
+
+  private def updateAdminChannel(inputId: String, channelId: String): Unit = {
+    streamState.modifyDiscordsData(dd => dd.view.mapValues(_.map {
+      case discord @ Discords(id, _, _, _) if id == inputId =>
+        discord.copy(adminChannel = channelId)
+      case other => other
+    }).toMap)
+  }
+
+  private def updateBoostedChannel(inputId: String, channelId: String): Unit = {
+    streamState.modifyDiscordsData(dd => dd.view.mapValues(_.map {
+      case discord @ Discords(id, _, _, _) if id == inputId =>
+        discord.copy(boostedChannel = channelId)
+      case other => other
+    }).toMap)
+  }
+
+  /** Reuse the guild's existing role of this name, or create it with the given
+   *  colour. Used by /setup and /repair to (re)build the per-world poke roles. */
+  private def getOrCreateRole(guild: Guild, name: String, color: Color): Role = {
+    val existing = guild.getRolesByName(name, true)
+    if (!existing.isEmpty) existing.get(0)
+    else guild.createRole().setName(name).setColor(color).complete()
+  }
+
+  /** Apply the standard per-world channel/category permissions: grant the bot
+   *  the channel-management set and deny @everyone the ability to post. Used for
+   *  the world category and each world channel in /setup and /repair. */
+  private def grantWorldPerms(entity: IPermissionContainer, botRole: Role, publicRole: Role): Unit = {
+    entity.upsertPermissionOverride(botRole)
+      .grant(Permission.VIEW_CHANNEL)
+      .grant(Permission.MESSAGE_SEND)
+      .grant(Permission.MESSAGE_MENTION_EVERYONE)
+      .grant(Permission.MESSAGE_EMBED_LINKS)
+      .grant(Permission.MESSAGE_HISTORY)
+      .grant(Permission.MANAGE_CHANNEL)
+      .complete()
+    entity.upsertPermissionOverride(publicRole).deny(Permission.MESSAGE_SEND).complete()
+  }
+
+  /** Post a channel's intro/help embed (the "this channel shows ..." message)
+   *  if the channel exists. Used for the levels/deaths/activity channels. */
+  private def postChannelIntro(channel: TextChannel, description: String): Unit =
+    if (channel != null) {
+      val embed = new EmbedBuilder()
+      embed.setDescription(description)
+      embed.setThumbnail("https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Sign_(Library).gif")
+      embed.setColor(BrandColor)
+      channel.sendMessageEmbeds(embed.build()).queue()
+    }
+
+  /** Post the Galthen's Satchel cooldown-tracker embed + button into a guild's
+   *  notifications channel (done on every /setup and /repair of that channel). */
+  private def postGalthenTracker(channel: TextChannel): Unit = {
+    val galthenEmbed = new EmbedBuilder()
+    galthenEmbed.setColor(BrandColor)
+    galthenEmbed.setDescription("This is a **[Galthen's Satchel](https://www.tibiawiki.com.br/wiki/Galthen's_Satchel)** cooldown tracker.\nManage your cooldowns here:")
+    galthenEmbed.setThumbnail("https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Galthen's_Satchel.gif")
+    channel.sendMessageEmbeds(galthenEmbed.build()).addActionRow(
+      Button.primary("galthen default", "Cooldowns").withEmoji(Emoji.fromFormatted(Config.satchelEmoji))
+    ).queue()
+  }
+
+  /** Build the boosted boss + creature + server-save embeds and post them to a
+   *  guild's notifications channel with the server-save button, storing the
+   *  message id so the daily scheduler can edit it later. Used when /setup or
+   *  /repair (re)creates the notifications channel. */
+  private def postBoostedNotifications(channel: TextChannel, guild: Guild, world: String): Unit = {
+    val combinedFutures: Future[List[MessageEmbed]] = for {
+      bossEmbed <- boostedService.boostedBossEmbed()
+      creatureEmbed <- boostedService.boostedCreatureEmbed()
+    } yield List(bossEmbed, creatureEmbed)
+
+    combinedFutures.map { embeds =>
+      val allEmbeds = embeds ++ serverSaveExtraEmbeds(world)
+      channel
+        .sendMessageEmbeds(allEmbeds.asJava)
+        .setActionRow(Button.primary("boosted list", "Server Save Notifications").withEmoji(Emoji.fromFormatted(Config.letterEmoji)))
+        .queue(
+          (message: Message) => discordUpdateConfig(guild, "", "", "", message.getId, world),
+          (e: Throwable) => logger.warn(s"Failed to send boosted boss/creature message for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}':", e)
+        )
+    }
+  }
+
+  /** The role-subscription buttons under the fullbless/notifications embed. */
+  private def fullblessRoleButtons: List[Button] = List(
+    Button.success("fullbless", " ").withEmoji(Emoji.fromFormatted(Config.inqEmoji)),
+    Button.primary("nemesis", " ").withEmoji(Emoji.fromFormatted(Config.bossEmoji)),
+    Button.danger("allypk", " ").withEmoji(Emoji.fromFormatted(Config.hazardEmoji)),
+    Button.secondary("masslog", " ").withEmoji(Emoji.fromFormatted(Config.masslogEmoji))
+  )
+
+  /** The "the bot will poke" role-notification embed for a world. Built by both
+   *  /setup (initial post) and /fullbless (edits the existing message). */
+  private def fullblessRoleEmbed(world: String, fullblessRoleId: String, nemesisRoleId: String, allyPkRoleId: String, masslogRoleId: String, level: Int): MessageEmbed =
+    new EmbedBuilder()
+      .setTitle(s":crossed_swords: $world :crossed_swords:", s"https://www.tibia.com/community/?subtopic=worlds&world=$world")
+      .setThumbnail("https://raw.githubusercontent.com/Leo32onGIT/tibia-bot-resources/main/Phantasmal_Ooze.gif")
+      .setColor(BrandColor)
+      .setFooter("Add or remove yourself from the role using the buttons below:")
+      .setDescription(s"The bot will poke:\n${Config.inqEmoji}<@&$fullblessRoleId> If an enemy fullblesses and is over level `$level`\n${Config.bossEmoji}<@&$nemesisRoleId> If anyone dies to a rare boss\n${Config.hazardEmoji}<@&$allyPkRoleId> If an ally gets pked\n${Config.masslogEmoji}<@&$masslogRoleId> If enemies masslog on **$world**")
+      .build()
+
+  def createChannels(event: SlashCommandInteractionEvent): MessageEmbed = {
+    // get guild & world information from the slash interaction
+    val world: String = com.tibiabot.domain.WorldName.formal(event.getInteraction.getOptions.asScala.find(_.getName == "world").map(_.getAsString).getOrElse("").trim())
+    // The role/category/channel/permission creation below is a long sequence of
+    // blocking .complete() calls. If any one throws (missing permission, Discord
+    // error, channel cap) the server is left half-built and the slash interaction
+    // would otherwise hang with no reply — so report it cleanly and point at /repair.
+    val embedText = try {
+      if (Config.worldList.contains(world)) {
+      // get guild id
+      val guild = event.getGuild
+
+      // assume initial run on this server and attempt to create core databases
+      createConfigDatabase(guild)
+
+      val botRole = guild.getBotRole
+      val fullblessRole = getOrCreateRole(guild, s"$world Fullbless", new Color(0, 156, 70))
+      val nemesisRole = getOrCreateRole(guild, s"$world Rare Boss", new Color(164, 76, 230))
+      val allyPkRole = getOrCreateRole(guild, s"$world PVP", new Color(220, 0, 0))
+      val masslogRole = getOrCreateRole(guild, s"$world Masslog", new Color(219, 175, 72))
+
+      // touch the worlds config so listWorlds runs its ALTER TABLE column
+      // migrations on older databases before /setup writes to the table
+      worldConfig(guild)
+
+      // see if admin channels exist
+      val discordConfig = discordRetrieveConfig(guild)
+      if (discordConfig.isEmpty) {
+        val adminCategory = guild.createCategory("Violent Bot").complete()
+        adminCategory.upsertPermissionOverride(botRole)
+          .grant(Permission.VIEW_CHANNEL)
+          .grant(Permission.MESSAGE_SEND)
+          .complete()
+        adminCategory.upsertPermissionOverride(guild.getPublicRole).grant(Permission.VIEW_CHANNEL).queue()
+        val adminChannel = guild.createTextChannel("🖥️・ᴄᴏᴍᴍᴀɴᴅ ʟᴏɢ", adminCategory).complete()
+        // restrict the channel so only roles with Permission.MANAGE_MESSAGES can write to the channels
+        adminChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_SEND).complete()
+        adminChannel.upsertPermissionOverride(botRole).grant(Permission.VIEW_CHANNEL).complete()
+        adminChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_EMBED_LINKS).complete()
+        adminChannel.upsertPermissionOverride(guild.getPublicRole).deny(Permission.VIEW_CHANNEL).queue()
+        val guildOwner = if (guild.getOwner == null) "Not Available" else guild.getOwner.getEffectiveName
+        discordCreateConfig(guild, guild.getName, guildOwner, adminCategory.getId, adminChannel.getId, "0", "0", ZonedDateTime.now())
+
+        val boostedChannel = guild.createTextChannel("👑・ɴᴏᴛɪғɪᴄᴀᴛɪᴏɴs", adminCategory).complete()
+        boostedChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_SEND).complete()
+        boostedChannel.upsertPermissionOverride(botRole).grant(Permission.VIEW_CHANNEL).complete()
+        boostedChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_EMBED_LINKS).complete()
+        boostedChannel.upsertPermissionOverride(guild.getPublicRole).grant(Permission.VIEW_CHANNEL).queue()
+        discordUpdateConfig(guild, "", "", boostedChannel.getId, "", world)
+
+        postGalthenTracker(boostedChannel)
+
+        postBoostedNotifications(boostedChannel, guild, world)
+      } else {
+        var adminCategoryCheck = guild.getCategoryById(discordConfig("admin_category"))
+        val adminChannelCheck = guild.getTextChannelById(discordConfig("admin_channel"))
+        val boostedChannelCheck = guild.getTextChannelById(discordConfig("boosted_channel"))
+        if (adminCategoryCheck == null) {
+          // admin category has been deleted
+          val adminCategory = guild.createCategory("Violent Bot").complete()
+          adminCategory.upsertPermissionOverride(botRole)
+            .grant(Permission.VIEW_CHANNEL)
+            .grant(Permission.MESSAGE_SEND)
+            .complete()
+          adminCategory.upsertPermissionOverride(guild.getPublicRole).deny(Permission.VIEW_CHANNEL).queue()
+          discordUpdateConfig(guild, adminCategory.getId, "", "", "", world)
+          adminCategoryCheck = adminCategory
+        }
+        if (adminChannelCheck == null) {
+          // admin channel has been deleted
+          val adminChannel = guild.createTextChannel("🖥️・ᴄᴏᴍᴍᴀɴᴅ ʟᴏɢ", adminCategoryCheck).complete()
+          adminChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_SEND).complete()
+          adminChannel.upsertPermissionOverride(botRole).grant(Permission.VIEW_CHANNEL).complete()
+          adminChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_EMBED_LINKS).complete()
+          adminChannel.upsertPermissionOverride(guild.getPublicRole).deny(Permission.VIEW_CHANNEL).queue()
+          discordUpdateConfig(guild, "", adminChannel.getId, "", "", world)
+        }
+        if (boostedChannelCheck == null) {
+          // admin category still exists
+          val boostedChannel = guild.createTextChannel("👑・ɴᴏᴛɪғɪᴄᴀᴛɪᴏɴs", adminCategoryCheck).complete()
+          boostedChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_SEND).complete()
+          boostedChannel.upsertPermissionOverride(botRole).grant(Permission.VIEW_CHANNEL).complete()
+          boostedChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_EMBED_LINKS).complete()
+          boostedChannel.upsertPermissionOverride(guild.getPublicRole).deny(Permission.VIEW_CHANNEL).queue()
+          discordUpdateConfig(guild, "", "", boostedChannel.getId, "", world)
+
+          postGalthenTracker(boostedChannel)
+
+          postBoostedNotifications(boostedChannel, guild, world)
+        }
+      }
+      // check is world has already been setup
+      val worldConfigData = worldRetrieveConfig(guild, world)
+      // it it doesn't create it
+      if (worldConfigData.isEmpty) {
+        // create the category
+        val newCategory = guild.createCategory(world).complete()
+        grantWorldPerms(newCategory, botRole, guild.getPublicRole)
+        // create the channels
+        val alliesChannel = guild.createTextChannel("📈・ᴏɴʟɪɴᴇ", newCategory).complete()
+
+        val deathsChannel = guild.createTextChannel("💀・ᴅᴇᴀᴛʜs", newCategory).complete()
+        val levelsChannel = guild.createTextChannel("💖・ʟᴇᴠᴇʟs", newCategory).complete()
+        val activityChannel = guild.createTextChannel("📝・ᴀᴄᴛɪᴠɪᴛʏ", newCategory).complete()
+
+        val publicRole = guild.getPublicRole
+        val channelList = List(alliesChannel, levelsChannel, deathsChannel, activityChannel)
+        channelList.foreach(grantWorldPerms(_, botRole, publicRole))
+
+        val notificationsConfig = discordRetrieveConfig(guild)
+        val notificationsChannel = guild.getTextChannelById(notificationsConfig("boosted_channel"))
+
+        if (notificationsChannel != null) {
+          if (notificationsChannel.canTalk()) {
+
+            // Fullbless Role
+            notificationsChannel.sendMessageEmbeds(fullblessRoleEmbed(world, fullblessRole.getId, nemesisRole.getId, allyPkRole.getId, masslogRole.getId, 250))
+              .setActionRow(fullblessRoleButtons: _*)
+              .queue()
+            }
+        }
+
+        val alliesId = alliesChannel.getId
+        val enemiesId = "0" //enemiesChannel.getId
+        val neutralsId = "0" //neutralsChannel.getId
+        val levelsId = levelsChannel.getId
+        val deathsId = deathsChannel.getId
+        val categoryId = newCategory.getId
+        val activityId = activityChannel.getId
+
+        // post initial embeds in the levels / deaths / activity channels
+        postChannelIntro(guild.getTextChannelById(levelsId), s":speech_balloon: This channel shows levels that have been gained on this world.\n\nYou can filter what appears in this channel using the **`/levels filter`** command.")
+        postChannelIntro(guild.getTextChannelById(deathsId), s":speech_balloon: This channel shows deaths that occur on this world.\n\nYou can filter what appears in this channel using the **`/deaths filter`** command.")
+        postChannelIntro(guild.getTextChannelById(activityId), s":speech_balloon: This channel shows change activity for *allied* or *enemy* players.\n\nIt will show events when a players **joins** or **leaves** one of these tracked guilds or **changes their name**.")
+
+        // update the database
+        worldCreateConfig(guild, world, alliesId, enemiesId, neutralsId, levelsId, deathsId, categoryId, fullblessRole.getId, nemesisRole.getId, allyPkRole.getId, masslogRole.getId, "0", "0", activityId)
+        startBot(Some(guild), Some(world))
+
+        // audit the setup in the command-log channel, matching /repair and /remove
+        val adminChannel = guild.getTextChannelById(discordRetrieveConfig(guild).getOrElse("admin_channel", "0"))
+        com.tibiabot.presentation.AdminLog.post(adminChannel, s"<@${event.getUser.getId}> has run `/setup` for the world **$world** and created its channels.", "https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Hammer.gif")
+
+        s":gear: The channels for **$world** have been configured successfully.\n⚠️ *You should probably mute the <#$levelsId> channel*"
+      } else {
+        // channels already exist
+        logger.info(s"The channels have already been setup on '${guild.getName} - ${guild.getId}'.")
+        s"${Config.noEmoji} The channels for **$world** have already been setup.\nUse `/repair` if you need to recreate channels for **$world** that you have deleted."
+      }
+      } else {
+        s"${Config.noEmoji} This is not a valid World on Tibia."
+      }
+    } catch {
+      case e: net.dv8tion.jda.api.exceptions.PermissionException =>
+        logger.warn(s"/setup of '$world' on guild '${event.getGuild.getId}' aborted on a missing permission: ${e.getMessage}")
+        s"${Config.noEmoji} I couldn't finish setting up **$world** because I'm missing a required permission. Grant me **Manage Roles**, **Manage Channels** and **Manage Permissions**, then run `/repair $world`."
+      case e: Exception =>
+        logger.warn(s"/setup of '$world' on guild '${event.getGuild.getId}' failed before completing", e)
+        s"${Config.noEmoji} Something went wrong while setting up **$world**, so it may be only partially configured. Wait a moment, then run `/repair $world` (or `/setup` again) to finish."
+    }
+    // embed reply
+    com.tibiabot.presentation.Embeds.response(embedText)
+  }
+
+  def repairChannel(event: SlashCommandInteractionEvent, world: String): MessageEmbed = {
+    val worldFormal = com.tibiabot.domain.WorldName.formal(world)
+    val guild = event.getGuild
+    val commandUser = event.getUser.getId
+    val embedBuild = new EmbedBuilder()
+    embedBuild.setColor(BrandColor)
+    embedBuild.setDescription(s"${Config.noEmoji} No action was taken as all channels for **$worldFormal** still exist.")
+    val cache: Option[List[Worlds]] = streamState.worldsData.get(guild.getId) match {
+      case Some(worlds) =>
+        val filteredWorlds = worlds.filter(w => w.name.toLowerCase() == world.toLowerCase())
+        if (filteredWorlds.nonEmpty) Some(filteredWorlds)
+        else None
+      case None => None
+    }
+    // Like /setup, this recreates roles/channels/overrides through blocking
+    // .complete() calls; guard so a mid-way failure reports cleanly instead of
+    // hanging the interaction with channels left half-recreated.
+    try {
+    if (cache.isDefined) {
+      // get the bots main roles
+      val botRole = guild.getBotRole
+      val publicRole = guild.getPublicRole
+
+      // get channel Ids
+      val categoryInfo: Option[String] = cache.flatMap(_.headOption.map(_.category))
+      val alliesChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.alliesChannel))
+      val enemiesChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.enemiesChannel))
+      val neutralsChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.neutralsChannel))
+      val levelsChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.levelsChannel))
+      val deathsChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.deathsChannel))
+      val activityChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.activityChannel))
+      val fullblessChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.fullblessChannel))
+      val onlineCombinedInfo: Option[String] = cache.flatMap(_.headOption.map(_.onlineCombined))
+
+      // get admin ids
+      val discordConfig = discordRetrieveConfig(guild)
+      var adminCategory = guild.getCategoryById(discordConfig("admin_category"))
+      var adminChannel = guild.getTextChannelById(discordConfig("admin_channel"))
+      var boostedChannel = guild.getTextChannelById(discordConfig("boosted_channel"))
+      var boostedMessage = discordConfig("boosted_messageid")
+
+      // get channel literals
+      var category = guild.getCategoryById(categoryInfo.getOrElse("0"))
+      val alliesChannel = guild.getTextChannelById(alliesChannelInfo.getOrElse("0"))
+      val enemiesChannel = guild.getTextChannelById(enemiesChannelInfo.getOrElse("0"))
+      val neutralsChannel = guild.getTextChannelById(neutralsChannelInfo.getOrElse("0"))
+      val levelsChannel = guild.getTextChannelById(levelsChannelInfo.getOrElse("0"))
+      val deathsChannel = guild.getTextChannelById(deathsChannelInfo.getOrElse("0"))
+      val activityChannel = guild.getTextChannelById(activityChannelInfo.getOrElse("0"))
+      val onlineCombinedVal = onlineCombinedInfo.getOrElse("true")
+
+      val onlineCombineCheck = onlineCombinedVal == "false" && (enemiesChannel == null || neutralsChannel == null)
+
+      val fullblessChannelId = fullblessChannelInfo.getOrElse("0")
+      if (fullblessChannelId == event.getChannel.getId) {
+        embedBuild.setDescription(s"${Config.noEmoji} That command would delete this channel, run it somewhere else.")
+        return embedBuild.build()
+      }
+      if (fullblessChannelId != "0") {
+        val fullblessChannel = guild.getTextChannelById(fullblessChannelId)
+        try {
+          fullblessChannel.delete.queue()
+        } catch {
+          case ex: Throwable => logger.warn(s"Failed to delete fullbless Channel ID: '${fullblessChannelId}' for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}'", ex)
+        }
+        worldRepairConfig(guild, worldFormal, "fullbless_channel", "0")
+      }
+      // check if any of the world channels need to be recreated
+      if (boostedChannel != null) {
+        if (boostedChannel.canTalk()) {
+          var fullblessMessage = false
+          var nemesisMessage = false
+          var allyPkMessage = false
+          val messages = boostedChannel.getHistory.retrievePast(100).complete().asScala.filter { m =>
+            m.getAuthor.getId.equals(botUser) && !m.isEphemeral
+          }
+
+          if (messages.nonEmpty) {
+            messages.foreach { message =>
+              val messageEmbeds = message.getEmbeds
+              if (messageEmbeds != null && !messageEmbeds.isEmpty){
+                val messageEmbed = messageEmbeds.get(0)
+                val messageTitle = messageEmbed.getTitle
+                if (messageTitle != null) {
+                  if (messageTitle.startsWith(s":crossed_swords: $worldFormal")) {
+                    fullblessMessage = true
+                  } else if (messageTitle.startsWith(s"${Config.nemesisEmoji} $worldFormal")) {
+                    nemesisMessage = true
+                  } else if (messageTitle.startsWith(s"${Config.hazardEmoji} $worldFormal")) {
+                    allyPkMessage = true
+                  }
+                }
+              }
+            }
+          }
+          val worldConfigData = worldRetrieveConfig(guild, world)
+          if (!fullblessMessage){
+            val fullblessLevel = worldConfigData("fullbless_level")
+            val fullblessRoleCheck = guild.getRoleById(worldConfigData("fullbless_role"))
+            val fullblessRole = if (fullblessRoleCheck == null) guild.createRole().setName(s"$worldFormal Fullbless").setColor(new Color(0, 156, 70)).complete() else fullblessRoleCheck
+            val nemesisRoleCheck = guild.getRoleById(worldConfigData("nemesis_role"))
+            val nemesisRole = if (nemesisRoleCheck == null) guild.createRole().setName(s"$worldFormal Rare Boss").setColor(new Color(164, 76, 230)).complete() else nemesisRoleCheck
+            val allyPkRoleCheck = guild.getRoleById(worldConfigData("allypk_role"))
+            val allyPkRole = if (allyPkRoleCheck == null) guild.createRole().setName(s"$worldFormal PVP").setColor(new Color(220, 0, 0)).complete() else allyPkRoleCheck
+            val masslogRoleCheck = guild.getRoleById(worldConfigData("masslog_role"))
+            val masslogRole = if (masslogRoleCheck == null) guild.createRole().setName(s"$worldFormal Masslog").setColor(new Color(219, 175, 72)).complete() else masslogRoleCheck
+
+            // Fullbless Role
+            val fullblessEmbed = new EmbedBuilder()
+            val fullblessEmbedText = s"The bot will poke:\n${Config.inqEmoji}<@&${fullblessRole.getId}> If an enemy fullblesses and is over level `${fullblessLevel}`\n${Config.bossEmoji}<@&${nemesisRole.getId}> If anyone dies to a rare boss\n${Config.hazardEmoji}<@&${allyPkRole.getId}> If an ally gets pked\n${Config.masslogEmoji}<@&${masslogRole.getId}> If enemies masslog on **$worldFormal**"
+            fullblessEmbed.setTitle(s":crossed_swords: $worldFormal :crossed_swords:", s"https://www.tibia.com/community/?subtopic=worlds&world=$worldFormal")
+            fullblessEmbed.setThumbnail(s"https://raw.githubusercontent.com/Leo32onGIT/tibia-bot-resources/main/Phantasmal_Ooze.gif")
+            fullblessEmbed.setColor(BrandColor)
+            fullblessEmbed.setFooter("Add or remove yourself from the role using the buttons below:")
+            fullblessEmbed.setDescription(fullblessEmbedText)
+            boostedChannel.sendMessageEmbeds(fullblessEmbed.build())
+              .setActionRow(
+                Button.success("fullbless", " ").withEmoji(Emoji.fromFormatted(s"${Config.inqEmoji}")),
+                Button.primary("nemesis", " ").withEmoji(Emoji.fromFormatted(s"${Config.bossEmoji}")),
+                Button.danger("allypk", " ").withEmoji(Emoji.fromFormatted(s"${Config.hazardEmoji}")),
+                Button.secondary("masslog", " ").withEmoji(Emoji.fromFormatted(s"${Config.masslogEmoji}"))
+              )
+              .queue()
+
+            // Update role id if it changed
+            worldRepairConfig(guild, worldFormal, "fullbless_role", fullblessRole.getId)
+            worldRepairConfig(guild, worldFormal, "nemesis_role", nemesisRole.getId)
+            worldRepairConfig(guild, worldFormal, "allypk_role", allyPkRole.getId)
+            worldRepairConfig(guild, worldFormal, "masslog_role", masslogRole.getId)
+
+            // update the record in worldsData
+            if (streamState.worldsData.contains(guild.getId)) {
+              val worldsList = streamState.worldsData(guild.getId)
+              val updatedWorldsList = worldsList.map { world =>
+                if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                  world.copy(fullblessChannel = "0", fullblessRole = fullblessRole.getId)
+                } else {
+                  world
+                }
+              }
+              streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+            }
+            // update the record in worldsData
+            if (streamState.worldsData.contains(guild.getId)) {
+              val worldsList = streamState.worldsData(guild.getId)
+              val updatedWorldsList = worldsList.map { world =>
+                if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                  world.copy(nemesisChannel = "0", nemesisRole = nemesisRole.getId)
+                } else {
+                  world
+                }
+              }
+              streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+            }
+            // update the record in worldsData
+            if (streamState.worldsData.contains(guild.getId)) {
+              val worldsList = streamState.worldsData(guild.getId)
+              val updatedWorldsList = worldsList.map { world =>
+                if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                  world.copy(allyPkRole = allyPkRole.getId)
+                } else {
+                  world
+                }
+              }
+              streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+            }
+            // update the record in worldsData
+            if (streamState.worldsData.contains(guild.getId)) {
+              val worldsList = streamState.worldsData(guild.getId)
+              val updatedWorldsList = worldsList.map { world =>
+                if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                  world.copy(masslogRole = masslogRole.getId)
+                } else {
+                  world
+                }
+              }
+              streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+            }
+            embedBuild.setDescription(s"${Config.yesEmoji} Missing notification message was recreated.")
+          }
+          if (boostedMessage != "0") {
+            val boostedMessageAction = boostedChannel.retrieveMessageById(boostedMessage)
+            try {
+              boostedMessageAction.complete()
+            } catch {
+              case e: Throwable =>
+                postBoostedNotifications(boostedChannel, guild, worldFormal)
+            }
+          }
+        } else {
+          embedBuild.setDescription(s"${Config.noEmoji} The bot does not have VIEW/SEND permissions for the channel: **${boostedChannel.getName}**.\nI suggest you delete that channel and run the command again.")
+        }
+      }
+
+      if (alliesChannel == null || onlineCombineCheck || levelsChannel == null || deathsChannel == null || activityChannel == null || adminChannel == null || boostedChannel == null) {
+        if (category == null) { // category has been deleted:
+          // create the category
+          val newCategory = guild.createCategory(world).complete()
+          grantWorldPerms(newCategory, botRole, guild.getPublicRole)
+          category = newCategory
+          worldRepairConfig(guild, worldFormal, "category", newCategory.getId)
+
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(category = newCategory.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+        }
+        val channelList = ListBuffer[(TextChannel, Boolean)]()
+        // create the channels underneath the new/existing category
+        if (alliesChannel == null) {
+          val alliesName = if (onlineCombinedVal == "false") "🤍・ᴀʟʟɪᴇs" else "📈・ᴏɴʟɪɴᴇ"
+          val recreateAlliesChannel = guild.createTextChannel(s"$alliesName", category).complete()
+          channelList += ((recreateAlliesChannel, false))
+          worldRepairConfig(guild, worldFormal, "allies_channel", recreateAlliesChannel.getId)
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(alliesChannel = recreateAlliesChannel.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+        }
+        if (enemiesChannel == null && onlineCombinedVal == "false") {
+          val recreateEnemiesChannel = guild.createTextChannel("☠️・ᴇɴᴇᴍɪᴇs", category).complete()
+          channelList += ((recreateEnemiesChannel, false))
+          worldRepairConfig(guild, worldFormal, "enemies_channel", recreateEnemiesChannel.getId)
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(enemiesChannel = recreateEnemiesChannel.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+        }
+        if (neutralsChannel == null && onlineCombinedVal == "false") {
+          val recreateNeutralsChannel = guild.createTextChannel("📈・ɴᴇᴜᴛʀᴀʟs", category).complete()
+          channelList += ((recreateNeutralsChannel, false))
+          worldRepairConfig(guild, worldFormal, "neutrals_channel", recreateNeutralsChannel.getId)
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(neutralsChannel = recreateNeutralsChannel.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+        }
+        if (deathsChannel == null) {
+          val recreateDeathsChannel = guild.createTextChannel("💀・ᴅᴇᴀᴛʜs", category).complete()
+          channelList += ((recreateDeathsChannel, false))
+          worldRepairConfig(guild, worldFormal, "deaths_channel", recreateDeathsChannel.getId)
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(deathsChannel = recreateDeathsChannel.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+        }
+        if (levelsChannel == null) {
+          val recreateLevelsChannel = guild.createTextChannel("💖・ʟᴇᴠᴇʟs", category).complete()
+          channelList += ((recreateLevelsChannel, true))
+          worldRepairConfig(guild, worldFormal, "levels_channel", recreateLevelsChannel.getId)
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(levelsChannel = recreateLevelsChannel.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+        }
+        if (activityChannel == null) {
+          val recreateActivityChannel = guild.createTextChannel("📝・ᴀᴄᴛɪᴠɪᴛʏ", category).complete()
+          channelList += ((recreateActivityChannel, false))
+          worldRepairConfig(guild, worldFormal, "activity_channel", recreateActivityChannel.getId)
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(activityChannel = recreateActivityChannel.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+          // post initial embed in activity channel
+          postChannelIntro(recreateActivityChannel, s":speech_balloon: This channel shows change activity for *allied* or *enemy* players.\n\nIt will show events when a players **joins** or **leaves** one of these tracked guilds or **changes their name**.")
+        }
+
+        if (boostedChannel == null) {
+          if (adminCategory == null) {
+            val newAdminCategory = guild.createCategory("Violent Bot").complete()
+            newAdminCategory.upsertPermissionOverride(botRole)
+              .grant(Permission.VIEW_CHANNEL)
+              .grant(Permission.MESSAGE_SEND)
+              .complete()
+            newAdminCategory.upsertPermissionOverride(guild.getPublicRole).grant(Permission.VIEW_CHANNEL).queue()
+            adminCategory = newAdminCategory
+          }
+          // create the channel
+          val newBoostedChannel = guild.createTextChannel("👑・ɴᴏᴛɪғɪᴄᴀᴛɪᴏɴs", adminCategory).complete()
+
+          // restrict the channel so only roles with Permission.MANAGE_MESSAGES can write to the channels
+          newBoostedChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_SEND).complete()
+          newBoostedChannel.upsertPermissionOverride(botRole).grant(Permission.VIEW_CHANNEL).complete()
+          newBoostedChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_EMBED_LINKS).complete()
+          newBoostedChannel.upsertPermissionOverride(guild.getPublicRole).grant(Permission.VIEW_CHANNEL).queue()
+          boostedChannel = newBoostedChannel
+          // update db & cache
+          discordUpdateConfig(guild, adminCategory.getId, "", newBoostedChannel.getId, "", worldFormal)
+          updateBoostedChannel(guild.getId, newBoostedChannel.getId)
+
+          boostedChannel.upsertPermissionOverride(botRole)
+            .grant(Permission.VIEW_CHANNEL)
+            .grant(Permission.MESSAGE_SEND)
+            .grant(Permission.MESSAGE_EMBED_LINKS)
+            .grant(Permission.MESSAGE_HISTORY)
+            .grant(Permission.MANAGE_CHANNEL)
+            .complete()
+          boostedChannel.upsertPermissionOverride(publicRole)
+            .deny(Permission.MESSAGE_SEND)
+            .complete()
+
+          postGalthenTracker(boostedChannel)
+
+          // Boosted Boss + creature + server-save notifications (use the canonical
+          // world name so the Dream Courts lookup resolves)
+          postBoostedNotifications(boostedChannel, guild, worldFormal)
+
+          val worldConfigData = worldRetrieveConfig(guild, world)
+          val fullblessLevel = worldConfigData("fullbless_level")
+          val fullblessRoleCheck = guild.getRoleById(worldConfigData("fullbless_role"))
+          val fullblessRole = if (fullblessRoleCheck == null) guild.createRole().setName(s"$worldFormal Fullbless").setColor(new Color(0, 156, 70)).complete() else fullblessRoleCheck
+          val nemesisRoleCheck = guild.getRoleById(worldConfigData("nemesis_role"))
+          val nemesisRole = if (nemesisRoleCheck == null) guild.createRole().setName(s"$worldFormal Rare Boss").setColor(new Color(164, 76, 230)).complete() else nemesisRoleCheck
+          val allyPkRoleCheck = guild.getRoleById(worldConfigData("allypk_role"))
+          val allyPkRole = if (allyPkRoleCheck == null) guild.createRole().setName(s"$worldFormal PVP").setColor(new Color(220, 0, 0)).complete() else allyPkRoleCheck
+          val masslogRoleCheck = guild.getRoleById(worldConfigData("masslog_role"))
+          val masslogRole = if (masslogRoleCheck == null) guild.createRole().setName(s"$worldFormal Masslog").setColor(new Color(219, 175, 72)).complete() else masslogRoleCheck
+
+          // Fullbless Role
+          val fullblessEmbed = new EmbedBuilder()
+          val fullblessEmbedText = s"The bot will poke:\n${Config.inqEmoji}<@&${fullblessRole.getId}> If an enemy fullblesses and is over level `${fullblessLevel}`\n${Config.bossEmoji}<@&${nemesisRole.getId}> If anyone dies to a rare boss\n${Config.hazardEmoji}<@&${allyPkRole.getId}> If an ally gets pked\n${Config.masslogEmoji}<@&${masslogRole.getId}> If enemies masslog on **$worldFormal**"
+          fullblessEmbed.setTitle(s":crossed_swords: $worldFormal :crossed_swords:", s"https://www.tibia.com/community/?subtopic=worlds&world=$worldFormal")
+          fullblessEmbed.setThumbnail(s"https://raw.githubusercontent.com/Leo32onGIT/tibia-bot-resources/main/Phantasmal_Ooze.gif")
+          fullblessEmbed.setColor(BrandColor)
+          fullblessEmbed.setFooter("Add or remove yourself from the role using the buttons below:")
+          fullblessEmbed.setDescription(fullblessEmbedText)
+          boostedChannel.sendMessageEmbeds(fullblessEmbed.build())
+            .setActionRow(
+              Button.success("fullbless", " ").withEmoji(Emoji.fromFormatted(s"${Config.inqEmoji}")),
+              Button.primary("nemesis", " ").withEmoji(Emoji.fromFormatted(s"${Config.bossEmoji}")),
+              Button.danger("allypk", " ").withEmoji(Emoji.fromFormatted(s"${Config.hazardEmoji}")),
+              Button.secondary("masslog", " ").withEmoji(Emoji.fromFormatted(s"${Config.masslogEmoji}"))
+            )
+            .queue()
+          // Update role id if it changed
+          worldRepairConfig(guild, worldFormal, "fullbless_role", fullblessRole.getId)
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(fullblessChannel = "0", fullblessRole = fullblessRole.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+
+          // Update role id if it changed
+          worldRepairConfig(guild, worldFormal, "nemesis_role", nemesisRole.getId)
+
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(nemesisChannel = "0", nemesisRole = nemesisRole.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+          // Update role id if it changed
+          worldRepairConfig(guild, worldFormal, "allypk_role", allyPkRole.getId)
+
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(allyPkRole = allyPkRole.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+
+          // Update role id if it changed
+          worldRepairConfig(guild, worldFormal, "masslog_role", masslogRole.getId)
+
+          // update the record in worldsData
+          if (streamState.worldsData.contains(guild.getId)) {
+            val worldsList = streamState.worldsData(guild.getId)
+            val updatedWorldsList = worldsList.map { world =>
+              if (world.name.toLowerCase == worldFormal.toLowerCase) {
+                world.copy(masslogRole = masslogRole.getId)
+              } else {
+                world
+              }
+            }
+            streamState.modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
+          }
+        }
+
+        // apply required permissions to the new channel(s)
+        if (channelList.nonEmpty) {
+          channelList.foreach { case (channel, _) =>
+            grantWorldPerms(channel, botRole, publicRole)
+          }
+        }
+        // recreate admin channel and/or category
+        if (adminChannel == null) {
+          if (adminCategory == null) {
+            val newAdminCategory = guild.createCategory("Violent Bot").complete()
+            newAdminCategory.upsertPermissionOverride(botRole)
+              .grant(Permission.VIEW_CHANNEL)
+              .grant(Permission.MESSAGE_SEND)
+              .complete()
+            newAdminCategory.upsertPermissionOverride(guild.getPublicRole).grant(Permission.VIEW_CHANNEL).queue()
+            adminCategory = newAdminCategory
+          }
+          // create the channel
+          val newAdminChannel = guild.createTextChannel("🖥️・ᴄᴏᴍᴍᴀɴᴅ ʟᴏɢ", adminCategory).complete()
+          // restrict the channel so only roles with Permission.MANAGE_MESSAGES can write to the channels
+          newAdminChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_SEND).complete()
+          newAdminChannel.upsertPermissionOverride(botRole).grant(Permission.VIEW_CHANNEL).complete()
+          newAdminChannel.upsertPermissionOverride(botRole).grant(Permission.MESSAGE_EMBED_LINKS).complete()
+          newAdminChannel.upsertPermissionOverride(guild.getPublicRole).deny(Permission.VIEW_CHANNEL).queue()
+          adminChannel = newAdminChannel
+          // update db & cache
+          discordUpdateConfig(guild, adminCategory.getId, newAdminChannel.getId, "", "", worldFormal)
+          updateAdminChannel(guild.getId, newAdminChannel.getId)
+        }
+        com.tibiabot.presentation.AdminLog.post(adminChannel, s"<@$commandUser> has run `/repair` on the world **$worldFormal** and recreated missing channels.\n\nYou may need to rearrange their position within your discord server.", "https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Hammer.gif")
+        embedBuild.setDescription(s":gear: The missing channels for **$worldFormal** have been recreated.\nYou may need to rearrange their position within your discord server.")
+      }
+    } else {
+      embedBuild.setDescription(s"${Config.noEmoji} You cannot run a `/repair` on **$worldFormal** because that world has not been `/setup` yet.")
+    }
+    } catch {
+      case e: net.dv8tion.jda.api.exceptions.PermissionException =>
+        logger.warn(s"/repair of '$worldFormal' on guild '${guild.getId}' aborted on a missing permission: ${e.getMessage}")
+        embedBuild.setDescription(s"${Config.noEmoji} I couldn't finish repairing **$worldFormal** because I'm missing a required permission. Grant me **Manage Roles**, **Manage Channels** and **Manage Permissions**, then run `/repair $world` again.")
+      case e: Exception =>
+        logger.warn(s"/repair of '$worldFormal' on guild '${guild.getId}' failed before completing", e)
+        embedBuild.setDescription(s"${Config.noEmoji} Something went wrong while repairing **$worldFormal**; some channels may still be missing. Wait a moment, then run `/repair $world` again.")
+    }
+    embedBuild.build()
+  }
+
+  /** Delete a world's role if it still exists, logging (not throwing) on failure. */
+  private def deleteRoleQuietly(role: Role, roleId: String, guild: Guild): Unit =
+    if (role != null) {
+      try role.delete().queue()
+      catch {
+        case ex: Throwable => logger.warn(s"Failed to delete Role ID: '$roleId' for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}'", ex)
+      }
+    }
+
+  def removeChannels(event: SlashCommandInteractionEvent): MessageEmbed = {
+    // get guild & world information from the slash interaction
+    val world: String = com.tibiabot.domain.WorldName.formal(event.getInteraction.getOptions.asScala.find(_.getName == "world").map(_.getAsString).getOrElse("").trim())
+    val embedText = if (Config.worldList.contains(world) || Config.mergedWorlds.contains(world)) {
+      val guild = event.getGuild
+      val worldConfigData = worldRetrieveConfig(guild, world)
+      // Channel/category deletion below goes through blocking .complete() calls;
+      // guard so a mid-way failure reports cleanly instead of hanging the
+      // interaction with the world left partially removed.
+      try {
+      if (worldConfigData.nonEmpty) {
+        // get channel ids
+        val alliesChannelId = worldConfigData("allies_channel")
+        val enemiesChannelId = worldConfigData("enemies_channel")
+        val neutralsChannelId = worldConfigData("neutrals_channel")
+        val levelsChannelId = worldConfigData("levels_channel")
+        val deathsChannelId = worldConfigData("deaths_channel")
+        val fullblessChannelId = worldConfigData("fullbless_channel")
+        val nemesisChannelId = worldConfigData("nemesis_channel")
+        val categoryId = worldConfigData("category")
+        val activityChannelId = worldConfigData("activity_channel")
+        val channelIds = List(alliesChannelId, enemiesChannelId, neutralsChannelId, levelsChannelId, deathsChannelId, fullblessChannelId, nemesisChannelId, activityChannelId)
+
+        // check if command is being run in one of the channels being deleted
+        if (channelIds.contains(event.getChannel.getId)) {
+          return com.tibiabot.presentation.Embeds.response(s"${Config.noEmoji} That command would delete this channel, run it somewhere else.")
+        }
+
+        val fullblessRoleId = worldConfigData("fullbless_role")
+        val nemesisRoleId = worldConfigData("nemesis_role")
+        val allyPkRoleId = worldConfigData("allypk_role")
+        val masslogRoleId = worldConfigData("masslog_role")
+
+        val fullblessRole = guild.getRoleById(fullblessRoleId)
+        val nemesisRole = guild.getRoleById(nemesisRoleId)
+        val allyPkRole = guild.getRoleById(allyPkRoleId)
+        val masslogRole = guild.getRoleById(masslogRoleId)
+
+        deleteRoleQuietly(fullblessRole, fullblessRoleId, guild)
+        deleteRoleQuietly(nemesisRole, nemesisRoleId, guild)
+        deleteRoleQuietly(allyPkRole, allyPkRoleId, guild)
+        deleteRoleQuietly(masslogRole, masslogRoleId, guild)
+
+        // remove the guild from the world stream, cancelling it if now unused
+        streamSupervisor.removeGuildFromWorld(world, guild.getId)
+
+        // delete the channels & category
+        channelIds.foreach { channelId =>
+          val channel: TextChannel = guild.getTextChannelById(channelId)
+          if (channel != null) {
+            channel.delete().complete()
+          }
+        }
+
+        val category = guild.getCategoryById(categoryId)
+        if (category != null) {
+          category.delete().complete()
+        }
+
+        // remove from worldsData
+        val updatedWorldsData = streamState.worldsData.get(guild.getId)
+          .map(_.filterNot(_.name.toLowerCase() == world.toLowerCase()))
+          .map(worlds => streamState.worldsData + (guild.getId -> worlds))
+          .getOrElse(streamState.worldsData)
+        streamState.modifyWorldsData(_ => updatedWorldsData)
+
+        // remove from discordsData
+        streamState.discordsData.get(world)
+          .foreach { discords =>
+            val updatedDiscords = discords.filterNot(_.id == guild.getId)
+            streamState.modifyDiscordsData(_ + (world -> updatedDiscords))
+          }
+
+        // update the database
+        worldRemoveConfig(guild, world)
+
+        // If that was the guild's last world, the guild-level command-log and
+        // notifications channels (and the "Violent Bot" category) would be left
+        // orphaned, so remove them too. Otherwise audit the removal in the
+        // command-log channel (which survives).
+        val remainingWorlds = updatedWorldsData.get(guild.getId).getOrElse(Nil)
+        val discordConfig = discordRetrieveConfig(guild)
+        if (remainingWorlds.isEmpty) {
+          val boostedChannel = guild.getTextChannelById(discordConfig.getOrElse("boosted_channel", "0"))
+          if (boostedChannel != null) boostedChannel.delete().complete()
+          val adminChannel = guild.getTextChannelById(discordConfig.getOrElse("admin_channel", "0"))
+          if (adminChannel != null) adminChannel.delete().complete()
+          val adminCategory = guild.getCategoryById(discordConfig.getOrElse("admin_category", "0"))
+          if (adminCategory != null) adminCategory.delete().complete()
+        } else {
+          val adminChannel = guild.getTextChannelById(discordConfig.getOrElse("admin_channel", "0"))
+          com.tibiabot.presentation.AdminLog.post(adminChannel, s"<@${event.getUser.getId}> has run `/remove` on the world **$world** and deleted its channels.", "https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Hammer.gif")
+        }
+
+        s":gear: The world **$world** has been removed."
+      } else {
+        s"${Config.noEmoji} The world **$world** is not configured here."
+      }
+      } catch {
+        case e: net.dv8tion.jda.api.exceptions.PermissionException =>
+          logger.warn(s"/remove of '$world' on guild '${guild.getId}' aborted on a missing permission: ${e.getMessage}")
+          s"${Config.noEmoji} I couldn't finish removing **$world** because I'm missing a required permission. Grant me **Manage Channels** and **Manage Roles**, then run `/remove $world` again."
+        case e: Exception =>
+          logger.warn(s"/remove of '$world' on guild '${guild.getId}' failed before completing", e)
+          s"${Config.noEmoji} Something went wrong while removing **$world**; some channels may still remain. Wait a moment, then run `/remove $world` again."
+      }
+    } else {
+      s"${Config.noEmoji} This is not a valid World on Tibia."
+    }
+    // embed reply
+    com.tibiabot.presentation.Embeds.response(embedText)
+  }
 
   /** Posts the welcome/help message when the bot joins a new guild. */
   def discordJoin(event: GuildJoinEvent): Unit = {
