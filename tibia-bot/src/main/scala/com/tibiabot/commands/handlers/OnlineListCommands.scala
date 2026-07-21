@@ -13,7 +13,7 @@ object OnlineListCommands {
     event.getInteraction.getSubcommandName match {
       case "list" if toggleOption == "separate" || toggleOption == "combine" =>
         val worldOption = options.getOrElse("world", "")
-        val embed = BotApp.onlineListConfig(event, worldOption, toggleOption)
+        val embed = BotApp.worldSettingsService.onlineListConfig(event, worldOption, toggleOption)
         event.getHook.sendMessageEmbeds(embed).queue()
       case "list" =>
         () // unknown toggle: preserve prior no-op behaviour

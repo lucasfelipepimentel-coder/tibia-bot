@@ -69,7 +69,7 @@ final class ChannelService(
   private def discordUpdateConfig(guild: Guild, adminCategory: String, adminChannel: String, boostedChannel: String, boostedMessage: String, lastWorld: String): Unit =
     discordConfigRepository.update(guild.getId, adminCategory, adminChannel, boostedChannel, boostedMessage, lastWorld)
 
-  private def worldRepairConfig(guild: Guild, world: String, tableName: String, newValue: String): Unit =
+  def worldRepairConfig(guild: Guild, world: String, tableName: String, newValue: String): Unit =
     worldConfigRepository.updateWorldString(guild.getId, world, tableName, newValue)
 
   private def worldRemoveConfig(guild: Guild, query: String): Unit =
@@ -102,7 +102,7 @@ final class ChannelService(
   /** Apply the standard per-world channel/category permissions: grant the bot
    *  the channel-management set and deny @everyone the ability to post. Used for
    *  the world category and each world channel in /setup and /repair. */
-  private def grantWorldPerms(entity: IPermissionContainer, botRole: Role, publicRole: Role): Unit = {
+  def grantWorldPerms(entity: IPermissionContainer, botRole: Role, publicRole: Role): Unit = {
     entity.upsertPermissionOverride(botRole)
       .grant(Permission.VIEW_CHANNEL)
       .grant(Permission.MESSAGE_SEND)
@@ -160,7 +160,7 @@ final class ChannelService(
   }
 
   /** The role-subscription buttons under the fullbless/notifications embed. */
-  private def fullblessRoleButtons: List[Button] = List(
+  def fullblessRoleButtons: List[Button] = List(
     Button.success("fullbless", " ").withEmoji(Emoji.fromFormatted(Config.inqEmoji)),
     Button.primary("nemesis", " ").withEmoji(Emoji.fromFormatted(Config.bossEmoji)),
     Button.danger("allypk", " ").withEmoji(Emoji.fromFormatted(Config.hazardEmoji)),
@@ -169,7 +169,7 @@ final class ChannelService(
 
   /** The "the bot will poke" role-notification embed for a world. Built by both
    *  /setup (initial post) and /fullbless (edits the existing message). */
-  private def fullblessRoleEmbed(world: String, fullblessRoleId: String, nemesisRoleId: String, allyPkRoleId: String, masslogRoleId: String, level: Int): MessageEmbed =
+  def fullblessRoleEmbed(world: String, fullblessRoleId: String, nemesisRoleId: String, allyPkRoleId: String, masslogRoleId: String, level: Int): MessageEmbed =
     new EmbedBuilder()
       .setTitle(s":crossed_swords: $world :crossed_swords:", s"https://www.tibia.com/community/?subtopic=worlds&world=$world")
       .setThumbnail("https://raw.githubusercontent.com/Leo32onGIT/tibia-bot-resources/main/Phantasmal_Ooze.gif")

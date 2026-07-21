@@ -15,7 +15,7 @@ object FullblessCommands {
   def handle(event: SlashCommandInteractionEvent): Unit = {
     val options = Options.of(event)
     val worldOption = options.getOrElse("world", "")
-    val embed = BotApp.fullblessLevel(event, worldOption, parseLevel(options))
+    val embed = BotApp.worldSettingsService.fullblessLevel(event, worldOption, parseLevel(options))
     event.getHook.sendMessageEmbeds(embed).queue()
   }
 }

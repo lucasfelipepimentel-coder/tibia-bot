@@ -91,10 +91,10 @@ object AlliesCommands {
       case "deaths" =>
         if (authed) {
           if (toggleOption == "show") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "show", "allies", "deaths")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "show", "allies", "deaths")
             event.getHook.sendMessageEmbeds(embed).queue()
           } else if (toggleOption == "hide") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "hide", "allies", "deaths")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "hide", "allies", "deaths")
             event.getHook.sendMessageEmbeds(embed).queue()
           }
         } else {
@@ -104,10 +104,10 @@ object AlliesCommands {
       case "levels" =>
         if (authed) {
           if (toggleOption == "show") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "show", "allies", "levels")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "show", "allies", "levels")
             event.getHook.sendMessageEmbeds(embed).queue()
           } else if (toggleOption == "hide") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "hide", "allies", "levels")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "hide", "allies", "levels")
             event.getHook.sendMessageEmbeds(embed).queue()
           }
         } else {

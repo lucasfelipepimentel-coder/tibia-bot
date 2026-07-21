@@ -179,8 +179,6 @@ object BotApp extends App with StrictLogging {
   private val snapshotInterval = Config.Cache.characterSnapshotInterval
   actorSystem.scheduler.scheduleWithFixedDelay(snapshotInterval, snapshotInterval)(() => { charCachePersistence.save(characterCache); () })(ex)
 
-  val worlds: List[String] = Config.worldList
-
   // Per-guild channel/role setup lifecycle (extraction of the channel ops from
   // BotApp is in progress; currently holds discordJoin/discordLeave and
   // createChannels/`setup`). State mutation for join/leave stays in BotApp via
@@ -206,13 +204,17 @@ object BotApp extends App with StrictLogging {
     sharedConfigGuilds = Set("912739993015947324", "1176279097001918516", "1224670957466161234")
   )
 
+  // Per-world setting commands (auto-hunt detection, deaths/levels visibility,
+  // exiva-on-death, minimum level, fullbless level, leaderboards)
+  val worldSettingsService = new worldsettings.WorldSettingsService(
+    worldConfigRepository, discordConfigRepository, streamState, tibiaDataClient, channelService, botUser
+  )
+
   // Dream Courts boss rotation extracted to domain.time.DreamScarCycle.
   // dreamScar/dromeTime are written by the scheduler thread (and dreamScar also by
   // the /admin resync thread) but read every cycle by the per-world streams — so
   // they need @volatile for the same cross-thread visibility reason as the state
   // below; without it a stream can keep reading a stale boss/cycle after a shift.
-  val bossCycle = domain.time.DreamScarCycle.bossCycle
-  val indexOfBoss: Map[String, Int] = domain.time.DreamScarCycle.indexOfBoss
   @volatile var dreamScar: Map[String, String] = fetchDreamScarBosses().map(e => e.world -> e.boss).toMap
   @volatile var dreamScarLastCheck: String = System.currentTimeMillis().toString
   @volatile var dromeTime = domain.time.DromeCycle.initial // 27 May 2026 server save - increment 2 weeks from here
@@ -473,119 +475,91 @@ object BotApp extends App with StrictLogging {
     })
   }
 
+  /** Load a guild's hunted/allied/worlds/activity/customSort config into
+   *  streamState. Shared by both startBot paths (single-guild join vs. full
+   *  startup) — previously copy-pasted identically in each. */
+  private def loadGuildState(g: Guild): List[Worlds] = {
+    val guildId = g.getId
+
+    // get hunted Players
+    val huntedPlayers = playerConfig(g, "hunted_players")
+    modifyHuntedPlayersData(_ + (guildId -> huntedPlayers))
+
+    // get allied Players
+    val alliedPlayers = playerConfig(g, "allied_players")
+    modifyAlliedPlayersData(_ + (guildId -> alliedPlayers))
+
+    // get hunted guilds
+    val huntedGuilds = guildConfig(g, "hunted_guilds")
+    modifyHuntedGuildsData(_ + (guildId -> huntedGuilds))
+
+    // get allied guilds
+    val alliedGuilds = guildConfig(g, "allied_guilds")
+    modifyAlliedGuildsData(_ + (guildId -> alliedGuilds))
+
+    // get worlds
+    val worldsInfo = worldConfig(g)
+    modifyWorldsData(_ + (guildId -> worldsInfo))
+
+    // get tracked activity characters
+    val activityInfo = activityConfig(g, "tracked_activity")
+    modifyActivityData(_ + (guildId -> activityInfo))
+
+    // get customSort Data
+    val customSortInfo = customSortConfig(g, "online_list_categories")
+    modifyCustomSortData(_ + (guildId -> customSortInfo))
+
+    // set default activityCommandBlocker state
+    modifyActivityCommandBlocker(_ + (guildId -> false))
+
+    worldsInfo
+  }
+
+  /** Build a guild's Discords admin/boosted-channel record from its stored
+   *  config. Shared by both startBot paths. */
+  private def buildDiscordsEntry(g: Guild, guildId: String): Discords = {
+    val adminChannels = discordRetrieveConfig(g)
+    Discords(
+      id = guildId,
+      adminChannel = if (adminChannels.nonEmpty) adminChannels("admin_channel") else "0",
+      boostedChannel = if (adminChannels.nonEmpty) adminChannels("boosted_channel") else "0",
+      boostedMessage = if (adminChannels.nonEmpty) adminChannels("boosted_messageid") else "0"
+    )
+  }
+
   private def startBot(guild: Option[Guild], world: Option[String]): Unit = {
 
     if (guild.isDefined && world.isDefined) {
+      val g = guild.get
+      val guildId = g.getId
+      val worldsInfo = loadGuildState(g)
+      val discords = buildDiscordsEntry(g, guildId)
 
-      val guildId = guild.get.getId
-
-        // get hunted Players
-        val huntedPlayers = playerConfig(guild.get, "hunted_players")
-        modifyHuntedPlayersData(_ + (guildId -> huntedPlayers))
-
-        // get allied Players
-        val alliedPlayers = playerConfig(guild.get, "allied_players")
-        modifyAlliedPlayersData(_ + (guildId -> alliedPlayers))
-
-        // get hunted guilds
-        val huntedGuilds = guildConfig(guild.get, "hunted_guilds")
-        modifyHuntedGuildsData(_ + (guildId -> huntedGuilds))
-
-        // get allied guilds
-        val alliedGuilds = guildConfig(guild.get, "allied_guilds")
-        modifyAlliedGuildsData(_ + (guildId -> alliedGuilds))
-
-        // get worlds
-        val worldsInfo = worldConfig(guild.get)
-        modifyWorldsData(_ + (guildId -> worldsInfo))
-
-        // get tracked activity characters
-        val activityInfo = activityConfig(guild.get, "tracked_activity")
-        modifyActivityData(_ + (guildId -> activityInfo))
-
-        // get customSort Data
-        val customSortInfo = customSortConfig(guild.get, "online_list_categories")
-        modifyCustomSortData(_ + (guildId -> customSortInfo))
-
-        // set default activityCommandBlocker state
-        modifyActivityCommandBlocker(_ + (guildId -> false))
-
-        val adminChannels = discordRetrieveConfig(guild.get)
-        val adminChannelId = if (adminChannels.nonEmpty) adminChannels("admin_channel") else "0"
-        val boostedChannelId = if (adminChannels.nonEmpty) adminChannels("boosted_channel") else "0"
-        val boostedMessageId = if (adminChannels.nonEmpty) adminChannels("boosted_messageid") else "0"
-
-        worldsInfo.foreach{ w =>
-          if (w.name == world.get) {
-            val discords = Discords(
-              id = guildId,
-              adminChannel = adminChannelId,
-              boostedChannel = boostedChannelId,
-              boostedMessage = boostedMessageId
-            )
-            modifyDiscordsData(d => d.updated(w.name, discords :: d.getOrElse(w.name, Nil)))
-            // Preserves prior behaviour: when the world stream already exists it was
-            // left unchanged (the usedBy append was overwritten and never took effect);
-            // only an absent world starts a new stream.
-            if (!streamSupervisor.contains(world.get)) {
-              streamSupervisor.put(world.get, new TibiaBot(world.get).stream.run(), List(discords))
-            }
+      worldsInfo.foreach{ w =>
+        if (w.name == world.get) {
+          modifyDiscordsData(d => d.updated(w.name, discords :: d.getOrElse(w.name, Nil)))
+          // Preserves prior behaviour: when the world stream already exists it was
+          // left unchanged (the usedBy append was overwritten and never took effect);
+          // only an absent world starts a new stream.
+          if (!streamSupervisor.contains(world.get)) {
+            streamSupervisor.put(world.get, new TibiaBot(world.get).stream.run(), List(discords))
           }
         }
+      }
     } else {
       // build guild specific data map
       guilds.foreach{g =>
-
         val guildId = g.getId
 
-          if (checkConfigDatabase(g)) {
-            // get hunted Players
-            val huntedPlayers = playerConfig(g, "hunted_players")
-            modifyHuntedPlayersData(_ + (guildId -> huntedPlayers))
+        if (checkConfigDatabase(g)) {
+          val worldsInfo = loadGuildState(g)
+          val discords = buildDiscordsEntry(g, guildId)
 
-            // get allied Players
-            val alliedPlayers = playerConfig(g, "allied_players")
-            modifyAlliedPlayersData(_ + (guildId -> alliedPlayers))
-
-            // get hunted guilds
-            val huntedGuilds = guildConfig(g, "hunted_guilds")
-            modifyHuntedGuildsData(_ + (guildId -> huntedGuilds))
-
-            // get allied guilds
-            val alliedGuilds = guildConfig(g, "allied_guilds")
-            modifyAlliedGuildsData(_ + (guildId -> alliedGuilds))
-
-            // get worlds
-            val worldsInfo = worldConfig(g)
-            modifyWorldsData(_ + (guildId -> worldsInfo))
-
-            // get tracked activity characters
-            val activityInfo = activityConfig(g, "tracked_activity")
-            modifyActivityData(_ + (guildId -> activityInfo))
-
-            // get customSort Data
-            val customSortInfo = customSortConfig(g, "online_list_categories")
-            modifyCustomSortData(_ + (guildId -> customSortInfo))
-
-            // set default activityCommandBlocker state
-            modifyActivityCommandBlocker(_ + (guildId -> false))
-
-            val adminChannels = discordRetrieveConfig(g)
-            val adminChannelId = if (adminChannels.nonEmpty) adminChannels("admin_channel") else "0"
-            val boostedChannelId = if (adminChannels.nonEmpty) adminChannels("boosted_channel") else "0"
-            val boostedMessageId = if (adminChannels.nonEmpty) adminChannels("boosted_messageid") else "0"
-
-            // populate a new Discords list so i can only run 1 stream per world
-            worldsInfo.foreach{ w =>
-              val discords = Discords(
-                id = guildId,
-                adminChannel = adminChannelId,
-                boostedChannel = boostedChannelId,
-                boostedMessage = boostedMessageId
-              )
-              modifyDiscordsData(d => d.updated(w.name, discords :: d.getOrElse(w.name, Nil)))
-            }
+          // populate a new Discords list so i can only run 1 stream per world
+          worldsInfo.foreach{ w =>
+            modifyDiscordsData(d => d.updated(w.name, discords :: d.getOrElse(w.name, Nil)))
           }
+        }
       }
       discordsData.foreach { case (worldName, discordsList) =>
         streamSupervisor.put(worldName, new TibiaBot(worldName).stream.run(), discordsList)
@@ -593,14 +567,6 @@ object BotApp extends App with StrictLogging {
       }
       startUpComplete = true
     }
-
-    /***
-    // check if world parameter has been passed, and convert to a list
-    val guildWorlds = world match {
-      case Some(worldName) => worldsData.getOrElse(guild.getId, List()).filter(w => w.name == worldName)
-      case None => worldsData.getOrElse(guild.getId, List())
-    }
-    ***/
   }
 
   private def cleanHuntedList(): Unit =
@@ -636,36 +602,9 @@ object BotApp extends App with StrictLogging {
     if (dromeShow) List(rashidEmbed, dreamScarEmbed, dromeEmbed) else List(rashidEmbed, dreamScarEmbed)
   }
 
-  /** The role-subscription buttons under the fullbless/notifications embed. */
-  private def fullblessRoleButtons: List[Button] = List(
-    Button.success("fullbless", " ").withEmoji(Emoji.fromFormatted(Config.inqEmoji)),
-    Button.primary("nemesis", " ").withEmoji(Emoji.fromFormatted(Config.bossEmoji)),
-    Button.danger("allypk", " ").withEmoji(Emoji.fromFormatted(Config.hazardEmoji)),
-    Button.secondary("masslog", " ").withEmoji(Emoji.fromFormatted(Config.masslogEmoji))
-  )
-
-  /** The "the bot will poke" role-notification embed for a world. Built by both
-   *  /setup (initial post) and /fullbless (edits the existing message). */
-  private def fullblessRoleEmbed(world: String, fullblessRoleId: String, nemesisRoleId: String, allyPkRoleId: String, masslogRoleId: String, level: Int): MessageEmbed =
-    new EmbedBuilder()
-      .setTitle(s":crossed_swords: $world :crossed_swords:", s"https://www.tibia.com/community/?subtopic=worlds&world=$world")
-      .setThumbnail("https://raw.githubusercontent.com/Leo32onGIT/tibia-bot-resources/main/Phantasmal_Ooze.gif")
-      .setColor(BrandColor)
-      .setFooter("Add or remove yourself from the role using the buttons below:")
-      .setDescription(s"The bot will poke:\n${Config.inqEmoji}<@&$fullblessRoleId> If an enemy fullblesses and is over level `$level`\n${Config.bossEmoji}<@&$nemesisRoleId> If anyone dies to a rare boss\n${Config.hazardEmoji}<@&$allyPkRoleId> If an ally gets pked\n${Config.masslogEmoji}<@&$masslogRoleId> If enemies masslog on **$world**")
-      .build()
-
   def charUrl(char: String): String = presentation.Urls.charUrl(char)
 
   def guildUrl(guild: String): String = presentation.Urls.guildUrl(guild)
-
-  def updateBoostedMessage(inputId: String, messageId: String): Unit = {
-    modifyDiscordsData(dd => dd.view.mapValues(_.map {
-      case discord @ Discords(id, _, _, _) if id == inputId =>
-        discord.copy(boostedMessage = messageId)
-      case other => other
-    }).toMap)
-  }
 
   private def checkConfigDatabase(guild: Guild): Boolean = schemaInitializer.guildDatabaseExists(guild.getId)
 
@@ -687,8 +626,6 @@ object BotApp extends App with StrictLogging {
   private def removeLevelsCache(time: ZonedDateTime): Unit =
     cacheRepository.removeExpiredLevels(time)
 
-  private def createConfigDatabase(guild: Guild): Unit = schemaInitializer.initGuild(guild.getId, guild.getName)
-
   private def playerConfig(guild: Guild, query: String): List[Players] =
     huntedAlliedRepository.getPlayers(guild.getId, query)
 
@@ -704,12 +641,6 @@ object BotApp extends App with StrictLogging {
   private def worldConfig(guild: Guild): List[Worlds] =
     worldConfigRepository.listWorlds(guild.getId)
 
-  private def worldCreateConfig(guild: Guild, world: String, alliesChannel: String, enemiesChannel: String, neutralsChannels: String, levelsChannel: String, deathsChannel: String, category: String, fullblessRole: String, nemesisRole: String, allyPkRole: String, masslogRole: String, fullblessChannel: String, nemesisChannel: String, activityChannel: String): Unit =
-    worldConfigRepository.createWorld(guild.getId, world, alliesChannel, enemiesChannel, neutralsChannels, levelsChannel, deathsChannel, category, fullblessRole, nemesisRole, allyPkRole, masslogRole, fullblessChannel, nemesisChannel, activityChannel)
-
-  private def discordCreateConfig(guild: Guild, guildName: String, guildOwner: String, adminCategory: String, adminChannel: String, boostedChannel: String, boostedMessageId: String, created: ZonedDateTime): Unit =
-    discordConfigRepository.create(guild.getId, guildName, guildOwner, adminCategory, adminChannel, boostedChannel, boostedMessageId, created)
-
   private def discordUpdateConfig(guild: Guild, adminCategory: String, adminChannel: String, boostedChannel: String, boostedMessage: String, lastWorld: String): Unit =
     discordConfigRepository.update(guild.getId, adminCategory, adminChannel, boostedChannel, boostedMessage, lastWorld)
 
@@ -724,603 +655,9 @@ object BotApp extends App with StrictLogging {
    *  detection, deaths/levels visibility, exiva list, minimum level).
    *  Settings with additional side effects (e.g. fullbless level, which also
    *  edits a live Discord embed) implement their own, not this helper. */
-  private def updateWorldSetting[T](
-    guild: Guild,
-    world: String,
-    newValue: T,
-    currentValue: Worlds => Option[T],
-    applyValue: (Worlds, T) => Worlds,
-    persist: T => Unit,
-    alreadySetMessage: String,
-    nowSetMessage: String,
-    notConfiguredMessage: String,
-    adminLogMessage: String,
-    adminLogThumbnail: String
-  ): MessageEmbed = {
-    val embedBuild = new EmbedBuilder()
-    embedBuild.setColor(BrandColor)
-    val cache = worldsData.getOrElse(guild.getId, List()).filter(w => w.name.toLowerCase() == world.toLowerCase())
-    cache.headOption.flatMap(currentValue) match {
-      case None =>
-        embedBuild.setDescription(notConfiguredMessage)
-      case Some(existing) if existing == newValue =>
-        embedBuild.setDescription(alreadySetMessage)
-      case Some(_) =>
-        val modifiedWorlds = worldsData(guild.getId).map { w =>
-          if (w.name.toLowerCase() == world.toLowerCase()) applyValue(w, newValue) else w
-        }
-        modifyWorldsData(_ + (guild.getId -> modifiedWorlds))
-        persist(newValue)
-
-        val discordConfig = discordRetrieveConfig(guild)
-        val adminChannelId = if (discordConfig.nonEmpty) discordConfig("admin_channel") else ""
-        val adminChannel: TextChannel = guild.getTextChannelById(adminChannelId)
-        presentation.AdminLog.post(adminChannel, adminLogMessage, adminLogThumbnail)
-
-        embedBuild.setDescription(nowSetMessage)
-    }
-    embedBuild.build()
-  }
-
-  def detectHunted(event: SlashCommandInteractionEvent): MessageEmbed = {
-    val options: Map[String, String] = event.getInteraction.getOptions.asScala.map(option => option.getName.toLowerCase() -> option.getAsString.trim()).toMap
-    val worldOption: String = options.getOrElse("world", "")
-    val settingOption: String = options.getOrElse("option", "")
-    val worldFormal = domain.WorldName.formal(worldOption).trim
-    val guild = event.getGuild
-    val commandUser = event.getUser.getId
-    updateWorldSetting[String](
-      guild, worldOption, settingOption,
-      currentValue = w => Some(w.detectHunteds),
-      applyValue = (w, v) => w.copy(detectHunteds = v),
-      persist = v => detectHuntedsToDatabase(guild, worldFormal, v),
-      alreadySetMessage = s"${Config.noEmoji} **Automatic enemy detection** is already set to **$settingOption** for the world **$worldFormal**.",
-      nowSetMessage = s":gear: **Automatic enemy detection** is now set to **$settingOption** for the world **$worldFormal**.",
-      notConfiguredMessage = s"${Config.noEmoji} You need to run `/setup` and add **$worldFormal** before you can configure this setting.",
-      adminLogMessage = s"<@$commandUser> set **automatic enemy detection** to **$settingOption** for the world **$worldFormal**.",
-      adminLogThumbnail = "https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Armillary_Sphere_(TibiaMaps).gif"
-    )
-  }
-
-  private def detectHuntedsToDatabase(guild: Guild, world: String, detectSetting: String): Unit =
-    worldConfigRepository.updateWorldString(guild.getId, domain.WorldName.formal(world), "detect_hunteds", detectSetting)
-
-  def deathsLevelsHideShow(event: SlashCommandInteractionEvent, world: String, setting: String, playerType: String, channelType: String): MessageEmbed = {
-    val worldFormal = domain.WorldName.formal(world)
-    val guild = event.getGuild
-    val commandUser = event.getUser.getId
-    val settingType = if (setting == "show") "true" else "false"
-    val thumbnailIcon = playerType match {
-      case "allies"   => "Angel_Statue"
-      case "neutrals" => "Guardian_Statue"
-      case "enemies"  => "Stone_Coffin"
-      case _          => ""
-    }
-    updateWorldSetting[String](
-      guild, world, settingType,
-      currentValue = w => playerType match {
-        case "allies" =>
-          if (channelType == "deaths") Some(w.showAlliesDeaths)
-          else if (channelType == "levels") Some(w.showAlliesLevels)
-          else None
-        case "neutrals" =>
-          if (channelType == "deaths") Some(w.showNeutralDeaths)
-          else if (channelType == "levels") Some(w.showNeutralLevels)
-          else None
-        case "enemies" =>
-          if (channelType == "deaths") Some(w.showEnemiesDeaths)
-          else if (channelType == "levels") Some(w.showEnemiesLevels)
-          else None
-        case _ => None
-      },
-      applyValue = (w, v) => playerType match {
-        case "allies" =>
-          if (channelType == "deaths") w.copy(showAlliesDeaths = v)
-          else if (channelType == "levels") w.copy(showAlliesLevels = v)
-          else w
-        case "neutrals" =>
-          if (channelType == "deaths") w.copy(showNeutralDeaths = v)
-          else if (channelType == "levels") w.copy(showNeutralLevels = v)
-          else w
-        case "enemies" =>
-          if (channelType == "deaths") w.copy(showEnemiesDeaths = v)
-          else if (channelType == "levels") w.copy(showEnemiesLevels = v)
-          else w
-        case _ => w
-      },
-      persist = v => deathsLevelsHideShowToDatabase(guild, world, v, playerType, channelType),
-      alreadySetMessage = s"${Config.noEmoji} The **$channelType** channel is already set to **$setting $playerType** for the world **$worldFormal**.",
-      nowSetMessage = s":gear: The **$channelType** channel is now set to **$setting $playerType** for the world **$worldFormal**.",
-      notConfiguredMessage = s"${Config.noEmoji} You need to run `/setup` and add **$worldFormal** before you can configure this setting.",
-      adminLogMessage = s"<@$commandUser> set the **$channelType** channel to **$setting $playerType** for the world **$worldFormal**.",
-      adminLogThumbnail = s"https://www.tibiawiki.com.br/wiki/Special:Redirect/file/$thumbnailIcon.gif"
-    )
-  }
-
-  def exivaList(event: SlashCommandInteractionEvent): MessageEmbed = {
-    val options: Map[String, String] = event.getInteraction.getOptions.asScala.map(option => option.getName.toLowerCase() -> option.getAsString.trim()).toMap
-    val worldOption: String = options.getOrElse("world", "")
-    val settingOption: String = options.getOrElse("option", "")
-    val settingType = if (settingOption == "show") "true" else "false"
-    val worldFormal = domain.WorldName.formal(worldOption).trim
-    val guild = event.getGuild
-    val commandUser = event.getUser.getId
-    updateWorldSetting[String](
-      guild, worldOption, settingType,
-      currentValue = w => Some(w.exivaList),
-      applyValue = (w, v) => w.copy(exivaList = v),
-      persist = v => exivaListToDatabase(guild, worldFormal, v),
-      alreadySetMessage = s"${Config.noEmoji} The **exiva list on deaths** is already set to **$settingOption** for the world **$worldFormal**.",
-      nowSetMessage = s":gear: **exiva list on deaths** is now set to **$settingOption** for the world **$worldFormal**.",
-      notConfiguredMessage = s"${Config.noEmoji} You need to run `/setup` and add **$worldFormal** before you can configure this setting.",
-      adminLogMessage = s"<@$commandUser> set **exiva list on deaths** to **$settingOption** for the world **$worldFormal**.",
-      adminLogThumbnail = "https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Find_Person.gif"
-    )
-  }
-
-  private def exivaListToDatabase(guild: Guild, world: String, detectSetting: String): Unit =
-    worldConfigRepository.updateWorldString(guild.getId, domain.WorldName.formal(world), "exiva_list", detectSetting)
-
-  def onlineListConfig(event: SlashCommandInteractionEvent, world: String, setting: String): MessageEmbed = {
-    val worldFormal = domain.WorldName.formal(world)
-    val guild = event.getGuild
-    val commandUser = event.getUser.getId
-    val settingType = if (setting == "combine") "true" else "false"
-    val embedBuild = new EmbedBuilder()
-    embedBuild.setColor(BrandColor)
-    val thumbnailIcon = "Blackboard"
-    val cache = worldsData.getOrElse(guild.getId, List()).filter(w => w.name.toLowerCase() == world.toLowerCase())
-    val existingSetting = cache.headOption.map(_.onlineCombined)
-    if (existingSetting.isDefined) {
-      if (existingSetting.get == settingType) {
-        // embed reply
-        embedBuild.setDescription(s"${Config.noEmoji} The online list is already set to **$setting** for the world **$worldFormal**.")
-        embedBuild.build()
-      } else {
-
-        var disclaimer = ""
-
-        val cache: Option[List[Worlds]] = worldsData.get(guild.getId) match {
-          case Some(worlds) =>
-            val filteredWorlds = worlds.filter(w => w.name.toLowerCase() == world.toLowerCase())
-            if (filteredWorlds.nonEmpty) Some(filteredWorlds)
-            else None
-          case None => None
-        }
-
-        val categoryInfo: Option[String] = cache.flatMap(_.headOption.map(_.category))
-        val alliesChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.alliesChannel))
-        val enemiesChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.enemiesChannel))
-        val neutralsChannelInfo: Option[String] = cache.flatMap(_.headOption.map(_.neutralsChannel))
-
-        var category = guild.getCategoryById(categoryInfo.getOrElse("0"))
-        val alliesChannel = guild.getTextChannelById(alliesChannelInfo.getOrElse("0"))
-        val enemiesChannel = guild.getTextChannelById(enemiesChannelInfo.getOrElse("0"))
-        val neutralsChannel = guild.getTextChannelById(neutralsChannelInfo.getOrElse("0"))
-
-        val botRole = guild.getBotRole
-        val publicRole = guild.getPublicRole
-
-        if (setting == "combine") {
-
-          if (event.getChannel.getId == alliesChannelInfo.getOrElse("0") || event.getChannel.getId == enemiesChannelInfo.getOrElse("0") || event.getChannel.getId == neutralsChannelInfo.getOrElse("0")) {
-            embedBuild.setDescription(s"${Config.noEmoji} That command would delete this channel, run it somewhere else.")
-            return embedBuild.build()
-          }
-
-          if (alliesChannel != null) {
-            try {
-              alliesChannel.delete().queue()
-              disclaimer += s"\n- *The now unused `allies` channel has been deleted.*"
-            } catch {
-              case ex: Throwable => logger.warn(s"Failed to delete Channel ID: '${alliesChannelInfo}' for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}' while combining the online list", ex)
-            }
-          }
-
-          if (enemiesChannel != null) {
-            try {
-              enemiesChannel.delete().queue()
-              disclaimer += s"\n- *The now unused `enemies` channel has been deleted.*"
-            } catch {
-              case ex: Throwable => logger.warn(s"Failed to delete Channel ID: '${enemiesChannelInfo}' for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}' while combining the online list", ex)
-            }
-          }
-
-          if (neutralsChannel != null) {
-            try {
-              neutralsChannel.delete().queue()
-              disclaimer += s"\n- *The now unused `neutrals` channel has been deleted.*"
-            } catch {
-              case ex: Throwable => logger.warn(s"Failed to delete Channel ID: '${neutralsChannelInfo}' for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}' while combining the online list", ex)
-            }
-          }
-
-          // Now that separate channels are deleted, create a new 'online' channel
-          try {
-            if (category == null) {
-              // create the category
-              val newCategory = guild.createCategory(worldFormal).complete()
-              grantWorldPerms(newCategory, botRole, publicRole)
-              category = newCategory
-              worldRepairConfig(guild, worldFormal, "category", newCategory.getId)
-
-              // update the record in worldsData
-              if (worldsData.contains(guild.getId)) {
-                val worldsList = worldsData(guild.getId)
-                val updatedWorldsList = worldsList.map { world =>
-                  if (world.name.toLowerCase == worldFormal.toLowerCase) {
-                    world.copy(category = newCategory.getId)
-                  } else {
-                    world
-                  }
-                }
-                modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
-              }
-            }
-            // create the online channel
-            val recreateAlliesChannel = guild.createTextChannel("📈・ᴏɴʟɪɴᴇ", category).complete()
-            worldRepairConfig(guild, worldFormal, "allies_channel", recreateAlliesChannel.getId)
-            // update the record in worldsData
-            if (worldsData.contains(guild.getId)) {
-              val worldsList = worldsData(guild.getId)
-              val updatedWorldsList = worldsList.map { world =>
-                if (world.name.toLowerCase == worldFormal.toLowerCase) {
-                  world.copy(alliesChannel = recreateAlliesChannel.getId)
-                } else {
-                  world
-                }
-              }
-              modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
-            }
-            // apply permissions to created channel
-            grantWorldPerms(recreateAlliesChannel, botRole, publicRole)
-            disclaimer += s"\n- *You may want to move the new <#${recreateAlliesChannel.getId}> channel.*"
-          } catch {
-            case ex: Throwable => logger.warn(s"Failed to create category or online channels for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}' while combining the online list", ex)
-          }
-
-        } else {
-          // setting == "separate"
-
-          if (event.getChannel.getId == alliesChannelInfo.getOrElse("0")) {
-            embedBuild.setDescription(s"${Config.noEmoji} That command would delete this channel, run it somewhere else.")
-            return embedBuild.build()
-          }
-
-          // get the bots main roles
-          try {
-            if (category == null) {
-              // create the category
-              val newCategory = guild.createCategory(worldFormal).complete()
-              grantWorldPerms(newCategory, botRole, publicRole)
-              category = newCategory
-              worldRepairConfig(guild, worldFormal, "category", newCategory.getId)
-
-              // update the record in worldsData
-              if (worldsData.contains(guild.getId)) {
-                val worldsList = worldsData(guild.getId)
-                val updatedWorldsList = worldsList.map { world =>
-                  if (world.name.toLowerCase == worldFormal.toLowerCase) {
-                    world.copy(category = newCategory.getId)
-                  } else {
-                    world
-                  }
-                }
-                modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
-              }
-            } else {
-              try {
-                val categoryName = category.getName
-                if (categoryName != s"${worldFormal}") {
-                  val channelManager = category.getManager
-                  channelManager.setName(s"${worldFormal}").queue()
-                }
-              } catch {
-                case ex: Throwable => logger.warn(s"Failed to rename category for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}' while separating the online list", ex)
-              }
-            }
-            val channelList = ListBuffer[(TextChannel, Boolean)]()
-
-            // delete the combined 'online' channel
-            if (alliesChannel != null) {
-              try {
-                alliesChannel.delete().queue()
-                disclaimer += s"\n- *The now unused `online` channel has been deleted.*"
-              } catch {
-                case ex: Throwable => logger.warn(s"Failed to delete Channel ID: '${alliesChannelInfo}' for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}' while separating the online list", ex)
-              }
-            }
-
-            // create the channels underneath the new/existing category
-            val recreateAlliesChannel = guild.createTextChannel("🤍・ᴀʟʟɪᴇs", category).complete()
-            channelList += ((recreateAlliesChannel, false))
-            worldRepairConfig(guild, worldFormal, "allies_channel", recreateAlliesChannel.getId)
-            // update the record in worldsData
-            if (worldsData.contains(guild.getId)) {
-              val worldsList = worldsData(guild.getId)
-              val updatedWorldsList = worldsList.map { world =>
-                if (world.name.toLowerCase == worldFormal.toLowerCase) {
-                  world.copy(alliesChannel = recreateAlliesChannel.getId)
-                } else {
-                  world
-                }
-              }
-              modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
-            }
-            disclaimer += s"\n- *The channel <#${recreateAlliesChannel.getId}> has been recreated (you may want to move it).*"
-
-            if (enemiesChannel == null) {
-              val recreateEnemiesChannel = guild.createTextChannel("☠️・ᴇɴᴇᴍɪᴇs", category).complete()
-              channelList += ((recreateEnemiesChannel, false))
-              worldRepairConfig(guild, worldFormal, "enemies_channel", recreateEnemiesChannel.getId)
-              // update the record in worldsData
-              if (worldsData.contains(guild.getId)) {
-                val worldsList = worldsData(guild.getId)
-                val updatedWorldsList = worldsList.map { world =>
-                  if (world.name.toLowerCase == worldFormal.toLowerCase) {
-                    world.copy(enemiesChannel = recreateEnemiesChannel.getId)
-                  } else {
-                    world
-                  }
-                }
-                modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
-              }
-              disclaimer += s"\n- *The channel <#${recreateEnemiesChannel.getId}> has been recreated (you may want to move it).*"
-            }
-
-            if (neutralsChannel == null) {
-              val recreateNeutralsChannel = guild.createTextChannel("📈・ɴᴇᴜᴛʀᴀʟs", category).complete()
-              channelList += ((recreateNeutralsChannel, false))
-              worldRepairConfig(guild, worldFormal, "neutrals_channel", recreateNeutralsChannel.getId)
-              // update the record in worldsData
-              if (worldsData.contains(guild.getId)) {
-                val worldsList = worldsData(guild.getId)
-                val updatedWorldsList = worldsList.map { world =>
-                  if (world.name.toLowerCase == worldFormal.toLowerCase) {
-                    world.copy(neutralsChannel = recreateNeutralsChannel.getId)
-                  } else {
-                    world
-                  }
-                }
-                modifyWorldsData(_ + (guild.getId -> updatedWorldsList))
-              }
-              disclaimer += s"\n- *The channel <#${recreateNeutralsChannel.getId}> has been recreated (you may want to move it).*"
-            }
-            // apply required permissions to the new channel(s)
-            if (channelList.nonEmpty) {
-              channelList.foreach { case (channel, _) =>
-                grantWorldPerms(channel, botRole, publicRole)
-              }
-            }
-          } catch {
-            case ex: Throwable => logger.warn(s"Failed to create category, allies, enemies or neutrals channels for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}' while separating the online list", ex)
-          }
-        }
-
-        // set the setting here
-        val modifiedWorlds = worldsData(guild.getId).map { w =>
-          if (w.name.toLowerCase() == world.toLowerCase()) {
-            w.copy(onlineCombined = settingType)
-          } else {
-            w
-          }
-        }
-
-        modifyWorldsData(_ + (guild.getId -> modifiedWorlds))
-        onlineListConfigToDatabase(guild, world, settingType)
-
-        val discordConfig = discordRetrieveConfig(guild)
-        val adminChannelId = if (discordConfig.nonEmpty) discordConfig("admin_channel") else ""
-        val adminChannel: TextChannel = guild.getTextChannelById(adminChannelId)
-        presentation.AdminLog.post(adminChannel, s"<@$commandUser> set the online list channel to **$setting** for the world **$worldFormal**.\n$disclaimer", s"https://www.tibiawiki.com.br/wiki/Special:Redirect/file/$thumbnailIcon.gif")
-
-        embedBuild.setDescription(s":gear: The online list channel is now set to **$setting** for the world **$worldFormal**.\n$disclaimer")
-        embedBuild.build()
-      }
-    } else {
-      embedBuild.setDescription(s"${Config.noEmoji} You need to run `/setup` and add **$worldFormal** before you can configure this setting.")
-      embedBuild.build()
-    }
-  }
-
-  private def onlineListConfigToDatabase(guild: Guild, world: String, setting: String): Unit =
-    worldConfigRepository.updateWorldString(guild.getId, domain.WorldName.formal(world), "online_combined", setting)
-
   private def customSortConfig(guild: Guild, query: String): List[CustomSort] =
     customSortRepository.getAll(guild.getId)
 
-  private def deathsLevelsHideShowToDatabase(guild: Guild, world: String, setting: String, playerType: String, channelType: String): Unit = {
-    val worldFormal = domain.WorldName.formal(world)
-    val tablePrefix = playerType match {
-      case "allies" => "show_allies_"
-      case "neutrals" => "show_neutral_"
-      case "enemies" => "show_enemies_"
-      case _ => ""
-    }
-    val tableName = s"$tablePrefix$channelType"
-    worldConfigRepository.updateWorldString(guild.getId, worldFormal, tableName, setting)
-  }
-
-  def fullblessLevel(event: SlashCommandInteractionEvent, world: String, level: Int): MessageEmbed = {
-    val worldFormal = domain.WorldName.formal(world)
-    val guild = event.getGuild
-    val commandUser = event.getUser.getId
-    val embedBuild = new EmbedBuilder()
-    embedBuild.setColor(BrandColor)
-    val cache = worldsData.getOrElse(guild.getId, List()).filter(w => w.name.toLowerCase() == world.toLowerCase())
-    val levelSetting = cache.headOption.map(_.fullblessLevel).getOrElse(null)
-    if (levelSetting != null) {
-      if (levelSetting == level) {
-        // embed reply
-        embedBuild.setDescription(s"${Config.noEmoji} The level to poke for **enemy fullblesses**\nis already set to **$level** for the world **$worldFormal**.")
-        embedBuild.build()
-      } else {
-        // set the setting here
-        val modifiedWorlds = worldsData(guild.getId).map { w =>
-          if (w.name.toLowerCase() == world.toLowerCase()) {
-            w.copy(fullblessLevel = level)
-          } else {
-            w
-          }
-        }
-        modifyWorldsData(_ + (guild.getId -> modifiedWorlds))
-        fullblessLevelToDatabase(guild, worldFormal, level)
-
-        // edit the fullblesschannel embeds
-        val worldConfigData = worldRetrieveConfig(guild, world)
-        val discordConfig = discordRetrieveConfig(guild)
-        val adminChannel = guild.getTextChannelById(discordConfig("admin_channel"))
-        if (worldConfigData.nonEmpty) {
-          val fullblessChannelId = worldConfigData("fullbless_channel")
-          val channel: TextChannel = guild.getTextChannelById(fullblessChannelId)
-          if (channel != null) {
-            val messages = channel.getHistory.retrievePast(100).complete().asScala.filter(m => m.getAuthor.getId.equals(botUser))
-            if (messages.nonEmpty) {
-              val message = messages.head
-              val fullblessRole = worldConfigData("fullbless_role")
-              val nemesisRole = worldConfigData("nemesis_role")
-              val allyPkRole = worldConfigData("allypk_role")
-              val masslogRole = worldConfigData("masslog_role")
-
-              // Fullbless Role
-              message.editMessageEmbeds(fullblessRoleEmbed(worldFormal, fullblessRole, nemesisRole, allyPkRole, masslogRole, level))
-                .setActionRow(fullblessRoleButtons: _*)
-                .queue()
-            }
-          }
-        }
-        presentation.AdminLog.post(adminChannel, s"<@$commandUser> changed the level to poke for **enemy fullblesses**\nto **$level** for the world **$worldFormal**.", "https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Amulet_of_Loss.gif")
-
-        embedBuild.setDescription(s":gear: The level to poke for **enemy fullblesses**\nis now set to **$level** for the world **$worldFormal**.")
-        embedBuild.build()
-      }
-    } else {
-      embedBuild.setDescription(s"${Config.noEmoji} You need to run `/setup` and add **$worldFormal** before you can configure this setting.")
-      embedBuild.build()
-    }
-  }
-
-  def leaderboards(event: SlashCommandInteractionEvent, world: String, callback: MessageEmbed => Unit): Unit = {
-    val worldFormal = domain.WorldName.formal(world)
-    val embedBuild = new EmbedBuilder()
-    embedBuild.setColor(BrandColor)
-
-    if (Config.worldList.exists(_.equalsIgnoreCase(world))) {
-      // Get the high scores
-      val highScores: Future[Either[String, HighscoresResponse]] = tibiaDataClient.getHighscores(worldFormal, 1)
-
-      // Handle the Future result asynchronously
-      highScores.onComplete {
-        case scala.util.Success(Right(highscoreResponse)) =>
-          val currentPage = highscoreResponse.highscores.highscore_page.current_page
-          val totalPages = highscoreResponse.highscores.highscore_page.total_pages
-          embedBuild.setDescription(s"Current page: $currentPage\nTotal pages: $totalPages.")
-          callback(embedBuild.build())
-
-        case scala.util.Success(Left(errorMessage)) =>
-          embedBuild.setDescription(s"${Config.noEmoji} Failed to fetch highscores: $errorMessage")
-          callback(embedBuild.build())
-
-        case scala.util.Failure(exception) =>
-          embedBuild.setDescription(s"${Config.noEmoji} An error occurred: ${exception.toString}")
-          callback(embedBuild.build())
-      }
-    } else {
-      embedBuild.setDescription(s"${Config.noEmoji} **$worldFormal** is not a valid world.")
-      callback(embedBuild.build())
-    }
-  }
-
-
-  private def worldRepairConfig(guild: Guild, world: String, tableName: String, newValue: String): Unit =
-    worldConfigRepository.updateWorldString(guild.getId, world, tableName, newValue)
-
-  def minLevel(event: SlashCommandInteractionEvent, world: String, level: Int, levelsOrDeaths: String): MessageEmbed = {
-    val worldFormal = domain.WorldName.formal(world)
-    val guild = event.getGuild
-    val commandUser = event.getUser.getId
-    updateWorldSetting[Int](
-      guild, world, level,
-      currentValue = w => Some(if (levelsOrDeaths == "levels") w.levelsMin else w.deathsMin),
-      applyValue = (w, v) => if (levelsOrDeaths == "levels") w.copy(levelsMin = v) else w.copy(deathsMin = v),
-      persist = v => minLevelToDatabase(guild, worldFormal, v, levelsOrDeaths),
-      alreadySetMessage = s"${Config.noEmoji} The minimum level for the **$levelsOrDeaths channel**\nis already set to `$level` for the world **$worldFormal**.",
-      nowSetMessage = s":gear: The minimum level for the **$levelsOrDeaths channel**\nis now set to `$level` for the world **$worldFormal**.",
-      notConfiguredMessage = s"${Config.noEmoji} You need to run `/setup` and add **$worldFormal** before you can configure this setting.",
-      adminLogMessage = s"<@$commandUser> changed the minimum level for the **$levelsOrDeaths channel**\nto `$level` for the world **$worldFormal**.",
-      adminLogThumbnail = "https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Royal_Fanfare.gif"
-    )
-  }
-
-  private def fullblessLevelToDatabase(guild: Guild, world: String, level: Int): Unit =
-    worldConfigRepository.updateWorldInt(guild.getId, world, "fullbless_level", level)
-
-  private def minLevelToDatabase(guild: Guild, world: String, level: Int, levelOrDeath: String): Unit = {
-    val columnName = if (levelOrDeath == "levels") "levels_min" else "deaths_min"
-    worldConfigRepository.updateWorldInt(guild.getId, world, columnName, level)
-  }
-
-  /** Build the boosted boss + creature + server-save embeds and post them to a
-   *  guild's notifications channel with the server-save button, storing the
-   *  message id so the daily scheduler can edit it later. Used when /setup or
-   *  /repair (re)creates the notifications channel. */
-  private def postBoostedNotifications(channel: TextChannel, guild: Guild, world: String): Unit = {
-    val combinedFutures: Future[List[MessageEmbed]] = for {
-      bossEmbed <- boostedService.boostedBossEmbed()
-      creatureEmbed <- boostedService.boostedCreatureEmbed()
-    } yield List(bossEmbed, creatureEmbed)
-
-    combinedFutures.map { embeds =>
-      val allEmbeds = embeds ++ serverSaveExtraEmbeds(world)
-      channel
-        .sendMessageEmbeds(allEmbeds.asJava)
-        .setActionRow(Button.primary("boosted list", "Server Save Notifications").withEmoji(Emoji.fromFormatted(Config.letterEmoji)))
-        .queue(
-          (message: Message) => discordUpdateConfig(guild, "", "", "", message.getId, world),
-          (e: Throwable) => logger.warn(s"Failed to send boosted boss/creature message for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}':", e)
-        )
-    }
-  }
-
-  /** Post a channel's intro/help embed (the "this channel shows ..." message)
-   *  if the channel exists. Used for the levels/deaths/activity channels. */
-  private def postChannelIntro(channel: TextChannel, description: String): Unit =
-    if (channel != null) {
-      val embed = new EmbedBuilder()
-      embed.setDescription(description)
-      embed.setThumbnail("https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Sign_(Library).gif")
-      embed.setColor(BrandColor)
-      channel.sendMessageEmbeds(embed.build()).queue()
-    }
-
-  /** Post the Galthen's Satchel cooldown-tracker embed + button into a guild's
-   *  notifications channel (done on every /setup and /repair of that channel). */
-  private def postGalthenTracker(channel: TextChannel): Unit = {
-    val galthenEmbed = new EmbedBuilder()
-    galthenEmbed.setColor(BrandColor)
-    galthenEmbed.setDescription("This is a **[Galthen's Satchel](https://www.tibiawiki.com.br/wiki/Galthen's_Satchel)** cooldown tracker.\nManage your cooldowns here:")
-    galthenEmbed.setThumbnail("https://www.tibiawiki.com.br/wiki/Special:Redirect/file/Galthen's_Satchel.gif")
-    channel.sendMessageEmbeds(galthenEmbed.build()).addActionRow(
-      Button.primary("galthen default", "Cooldowns").withEmoji(Emoji.fromFormatted(Config.satchelEmoji))
-    ).queue()
-  }
-
-  /** Apply the standard per-world channel/category permissions: grant the bot
-   *  the channel-management set and deny @everyone the ability to post. Used for
-   *  the world category and each world channel in /setup and /repair. */
-  private def grantWorldPerms(entity: IPermissionContainer, botRole: Role, publicRole: Role): Unit = {
-    entity.upsertPermissionOverride(botRole)
-      .grant(Permission.VIEW_CHANNEL)
-      .grant(Permission.MESSAGE_SEND)
-      .grant(Permission.MESSAGE_MENTION_EVERYONE)
-      .grant(Permission.MESSAGE_EMBED_LINKS)
-      .grant(Permission.MESSAGE_HISTORY)
-      .grant(Permission.MANAGE_CHANNEL)
-      .complete()
-    entity.upsertPermissionOverride(publicRole).deny(Permission.MESSAGE_SEND).complete()
-  }
-
-  /** Delete a world's role if it still exists, logging (not throwing) on failure. */
   private def creatureImageUrl(creature: String): String =
     presentation.Urls.creatureImageUrl(creature, Config.creatureUrlMappings)
 

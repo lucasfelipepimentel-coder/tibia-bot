@@ -70,18 +70,18 @@ object NeutralCommands {
       subCommand match {
         case "deaths" =>
           if (toggleOption == "show") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "show", "neutrals", "deaths")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "show", "neutrals", "deaths")
             event.getHook.sendMessageEmbeds(embed).queue()
           } else if (toggleOption == "hide") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "hide", "neutrals", "deaths")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "hide", "neutrals", "deaths")
             event.getHook.sendMessageEmbeds(embed).queue()
           }
         case "levels" =>
           if (toggleOption == "show") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "show", "neutrals", "levels")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "show", "neutrals", "levels")
             event.getHook.sendMessageEmbeds(embed).queue()
           } else if (toggleOption == "hide") {
-            val embed = BotApp.deathsLevelsHideShow(event, worldOption, "hide", "neutrals", "levels")
+            val embed = BotApp.worldSettingsService.deathsLevelsHideShow(event, worldOption, "hide", "neutrals", "levels")
             event.getHook.sendMessageEmbeds(embed).queue()
           }
         case other =>

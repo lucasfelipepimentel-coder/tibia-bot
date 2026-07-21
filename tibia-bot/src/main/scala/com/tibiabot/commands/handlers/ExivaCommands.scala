@@ -9,7 +9,7 @@ object ExivaCommands {
   def handle(event: SlashCommandInteractionEvent): Unit = {
     event.getInteraction.getSubcommandName match {
       case "deaths" =>
-        val embed = BotApp.exivaList(event)
+        val embed = BotApp.worldSettingsService.exivaList(event)
         event.getHook.sendMessageEmbeds(embed).queue()
       case other =>
         val embed = new EmbedBuilder()

@@ -20,7 +20,7 @@ object FilterCommands {
 
     event.getInteraction.getSubcommandName match {
       case channel @ ("levels" | "deaths") =>
-        val embed = BotApp.minLevel(event, worldOption, levelOption, channel)
+        val embed = BotApp.worldSettingsService.minLevel(event, worldOption, levelOption, channel)
         event.getHook.sendMessageEmbeds(embed).queue()
       case other =>
         val embed = new EmbedBuilder()

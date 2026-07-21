@@ -7,7 +7,7 @@ import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEve
 object LeaderboardCommands {
   def handle(event: SlashCommandInteractionEvent): Unit = {
     val worldOption = Options.of(event).getOrElse("world", "")
-    BotApp.leaderboards(event, worldOption, embed => {
+    BotApp.worldSettingsService.leaderboards(event, worldOption, embed => {
       event.getHook.sendMessageEmbeds(embed).queue()
     })
   }
