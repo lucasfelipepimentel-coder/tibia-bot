@@ -4,13 +4,15 @@ WORKDIR /src
 
 COPY tibia-bot/ /src/
 
-RUN sbt -batch docker:stage
+RUN sbt -batch "Universal / stage"
 
 
 FROM eclipse-temurin:8-jre
 
-COPY --from=builder /src/target/docker/stage/opt /opt
+COPY --from=builder /src/target/universal/stage /opt/app
 
-WORKDIR /opt/docker
+WORKDIR /opt/app
 
-ENTRYPOINT ["/bin/sh", "-c", "exec $(find /opt/docker/bin -maxdepth 1 -type f ! -name '*.bat' | head -n 1)"]
+RUN chmod +x /opt/app/bin/violent-bot-dedicated
+
+ENTRYPOINT ["/opt/app/bin/violent-bot-dedicated"]
