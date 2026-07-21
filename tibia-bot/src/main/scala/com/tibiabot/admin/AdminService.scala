@@ -33,7 +33,7 @@ final class AdminService(
         adminChannel.sendMessageEmbeds(adminEmbed.build()).queue()
       } catch {
         case ex: Throwable =>
-          logger.info(s"Failed to send admin message for Guild ID: '${adminChannel.getGuild.getId}' Guild Name: '${adminChannel.getGuild.getName}'", ex)
+          logger.warn(s"Failed to send admin message for Guild ID: '${adminChannel.getGuild.getId}' Guild Name: '${adminChannel.getGuild.getName}'", ex)
       }
     }
 

@@ -103,7 +103,7 @@ final class SchemaInitializer(connectionProvider: ConnectionProvider) extends St
             logger.info("Database 'bot_cache' created successfully")
           } catch {
             case e: Throwable =>
-              logger.info("Database 'bot_cache' already exists, skipping creation", e)
+              logger.warn("Database 'bot_cache' already exists, skipping creation", e)
           }
         }
       } finally {

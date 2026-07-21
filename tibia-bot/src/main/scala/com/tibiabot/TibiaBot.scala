@@ -62,7 +62,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
   private var onlineListTableUpdateTimer: ZonedDateTime = ZonedDateTime.now().minusMinutes(10) // Start immediately
 
   private val tibiaDataClient: TibiaApi =
-    new tibiadata.CachingTibiaApi(new TibiaDataClient(), persistence.RedisCacheProvider.cache)(scala.concurrent.ExecutionContext.global)
+    new tibiadata.CachingTibiaApi(new TibiaDataClient(BotApp.streamState), persistence.RedisCacheProvider.cache)(scala.concurrent.ExecutionContext.global)
 
   private val deathRecentDuration = 30 * 60 // 30 minutes for a death to count as recent enough to be worth notifying
   private val onlineRecentDuration = 10 * 60 // 10 minutes for a character to still be checked for deaths after logging off
@@ -168,7 +168,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
         if (ZonedDateTime.now().isAfter(cacheTimer.plusMinutes(6))) {
           val cacheWorld = char.character.character.world
           val cacheFormerWorlds: List[String] = char.character.character.former_worlds.map(_.toList).getOrElse(Nil)
-          BotApp.addListToCache(charName, formerNamesList, cacheWorld, cacheFormerWorlds, guildName, char.character.character.level.toInt.toString, char.character.character.vocation, char.character.character.last_login.getOrElse(""), ZonedDateTime.now())
+          BotApp.huntedAlliedService.addListToCache(charName, formerNamesList, cacheWorld, cacheFormerWorlds, guildName, char.character.character.level.toInt.toString, char.character.character.vocation, char.character.character.last_login.getOrElse(""), ZonedDateTime.now())
           cacheListTimer = cacheListTimer + (world -> ZonedDateTime.now())
         }
 
@@ -244,7 +244,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                 if (oldName != ""){
                   // update name in cache and db
                   BotApp.modifyActivityData(m => m + (guildId -> updatedActivityData))
-                  BotApp.updateActivityToDatabase(guild, oldName, formerNamesList, guildName, ZonedDateTime.now(), charName)
+                  BotApp.huntedAlliedService.updateActivityToDatabase(guild, oldName, formerNamesList, guildName, ZonedDateTime.now(), charName)
                   skipJoinLeave = true
                   if (timeDelay.isDefined) {
                     val delayEndTime = timeDelay.map(_.plusMinutes(6))
@@ -252,7 +252,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                       // if player is in hunted or allied 'players' list, update information there too
                       if (huntedPlayerCheck) {
                         // change name in hunted players cache and db
-                        BotApp.updateHuntedOrAllyNameToDatabase(guild, "hunted", oldName, charName)
+                        BotApp.huntedAlliedService.updateHuntedOrAllyNameToDatabase(guild, "hunted", oldName, charName)
                         val updatedHuntedPlayersData = huntedPlayersData.getOrElse(guildId, List()).map { player =>
                           if (player.name.toLowerCase == oldName.toLowerCase) {
                             player.copy(name = charName.toLowerCase)
@@ -260,11 +260,11 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                             player
                           }
                         }
-                        BotApp.modifyHuntedPlayersData(m => m + (guildId -> updatedHuntedPlayersData))
+                        BotApp.huntedAlliedService.modifyHuntedPlayersData(m => m + (guildId -> updatedHuntedPlayersData))
                       }
                       if (allyPlayerCheck) {
                         // change name in allied players cache and db
-                        BotApp.updateHuntedOrAllyNameToDatabase(guild, "allied", oldName, charName)
+                        BotApp.huntedAlliedService.updateHuntedOrAllyNameToDatabase(guild, "allied", oldName, charName)
                         val updatedAlliedPlayersData = alliedPlayersData.getOrElse(guildId, List()).map { player =>
                           if (player.name.toLowerCase == oldName.toLowerCase) {
                             player.copy(name = charName.toLowerCase)
@@ -272,7 +272,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                             player
                           }
                         }
-                        BotApp.modifyAlliedPlayersData(m => m + (guildId -> updatedAlliedPlayersData))
+                        BotApp.huntedAlliedService.modifyAlliedPlayersData(m => m + (guildId -> updatedAlliedPlayersData))
                       }
                       if (activityTextChannel != null) {
                         if (activityTextChannel.canTalk() || (!Config.prod)) {
@@ -352,8 +352,8 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                           }
                           // remove from hunted list if in allied guild
                           if (allyGuildCheck) {
-                            BotApp.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name == charName)))
-                            BotApp.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
+                            BotApp.huntedAlliedService.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name == charName)))
+                            BotApp.huntedAlliedService.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
                             val adminTextChannel = guild.getTextChannelById(adminChannel)
                             if (adminTextChannel != null) {
                               if (adminTextChannel.canTalk() || (!Config.prod)) {
@@ -374,8 +374,8 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                         if (wasInHuntedGuild) {
                           if (!allyGuildCheck && !huntedGuildCheck && !huntedPlayerCheck && !allyPlayerCheck) {
                             // add them to cached huntedPlayersData list
-                            BotApp.modifyHuntedPlayersData(m => m + (guildId -> (BotApp.Players(charName.toLowerCase(), "false", s"was originally in hunted guild ${guildNameFromActivityData}", BotApp.botUser) :: m.getOrElse(guildId, List()))))
-                            BotApp.addHuntedToDatabase(guild, "player", charName.toLowerCase(), "false", s"was originally in hunted guild ${guildNameFromActivityData}", BotApp.botUser)
+                            BotApp.huntedAlliedService.modifyHuntedPlayersData(m => m + (guildId -> (BotApp.Players(charName.toLowerCase(), "false", s"was originally in hunted guild ${guildNameFromActivityData}", BotApp.botUser) :: m.getOrElse(guildId, List()))))
+                            BotApp.huntedAlliedService.addHuntedToDatabase(guild, "player", charName.toLowerCase(), "false", s"was originally in hunted guild ${guildNameFromActivityData}", BotApp.botUser)
                             val adminTextChannel = guild.getTextChannelById(adminChannel)
                             if (adminTextChannel != null) {
                               if (adminTextChannel.canTalk() || (!Config.prod)) {
@@ -394,7 +394,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                           if (!allyGuildCheck && !huntedGuildCheck && !huntedPlayerCheck && !allyPlayerCheck) {
                             // remove from activity
                             BotApp.modifyActivityData(m => m + (guildId -> m.getOrElse(guildId, List()).filterNot(_.name.equalsIgnoreCase(charName.toLowerCase))))
-                            BotApp.removePlayerActivityfromDatabase(guild, charName.toLowerCase)
+                            BotApp.huntedAlliedService.removePlayerActivityfromDatabase(guild, charName.toLowerCase)
                           }
                         }
                       }
@@ -405,8 +405,8 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                         // joined a hunted guild
                         if (huntedGuildCheck) {
                           // remove from hunted 'Player' cache and db
-                          BotApp.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
-                          BotApp.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
+                          BotApp.huntedAlliedService.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
+                          BotApp.huntedAlliedService.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
                           // send message to admin channel
                           val adminTextChannel = guild.getTextChannelById(adminChannel)
                           if (adminTextChannel != null) {
@@ -423,8 +423,8 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                           }
                         } else if (allyGuildCheck) {
                           // remove from hunted 'Player' cache and db
-                          BotApp.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
-                          BotApp.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
+                          BotApp.huntedAlliedService.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
+                          BotApp.huntedAlliedService.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
                           // send message to admin channel
                           val adminTextChannel = guild.getTextChannelById(adminChannel)
                           if (adminTextChannel != null) {
@@ -464,7 +464,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
 
                       // Update in cache and db
                       BotApp.modifyActivityData(m => m + (guildId -> updatedActivityData))
-                      BotApp.updateActivityToDatabase(guild, charName, formerNamesList, guildName, ZonedDateTime.now(), charName)
+                      BotApp.huntedAlliedService.updateActivityToDatabase(guild, charName, formerNamesList, guildName, ZonedDateTime.now(), charName)
                     }
                   }
                 } else if (joinGuild) { // Character doesn't exist in tracking_activity but should be
@@ -472,13 +472,13 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                   val newActivity = BotApp.PlayerCache(charName, formerNamesList, guildName, ZonedDateTime.now())
                   val updatedActivityData = newActivity :: activityData.getOrElse(guildId, List())
                   BotApp.modifyActivityData(m => m + (guildId -> updatedActivityData))
-                  BotApp.addActivityToDatabase(guild, charName, formerNamesList, guildName, ZonedDateTime.now())
+                  BotApp.huntedAlliedService.addActivityToDatabase(guild, charName, formerNamesList, guildName, ZonedDateTime.now())
                   // joined a hunted guild
                   if (huntedGuildCheck) {
                     if (huntedPlayerCheck) { // was he originally in hunted 'player' list?
                       // remove from hunted 'Player' cache and db
-                      BotApp.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
-                      BotApp.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
+                      BotApp.huntedAlliedService.modifyHuntedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
+                      BotApp.huntedAlliedService.removeHuntedFromDatabase(guild, "player", charName.toLowerCase())
                       // send message to admin channel
                       val adminTextChannel = guild.getTextChannelById(adminChannel)
                       if (adminTextChannel != null) {
@@ -497,8 +497,8 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                   } else if (allyGuildCheck) { // joined an allied guild
                     if (allyPlayerCheck) {
                       // remove from allied 'Player' cache and db
-                      BotApp.modifyAlliedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
-                      BotApp.removeAllyFromDatabase(guild, "player", charName.toLowerCase())
+                      BotApp.huntedAlliedService.modifyAlliedPlayersData(m => m.updated(guildId, m.getOrElse(guildId, List.empty).filterNot(_.name.toLowerCase == charName.toLowerCase)))
+                      BotApp.huntedAlliedService.removeAllyFromDatabase(guild, "player", charName.toLowerCase())
                       // send message to admin channel
                       val adminTextChannel = guild.getTextChannelById(adminChannel)
                       if (adminTextChannel != null) {
@@ -849,9 +849,9 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                           huntedBuffer.foreach { case (player, world, vocation, level) =>
                             val playerString = player.toLowerCase()
                             // add them to cached huntedPlayersData list
-                            BotApp.modifyHuntedPlayersData(m => m + (guildId -> (BotApp.Players(playerString, "false", "killed an allied player", BotApp.botUser) :: m.getOrElse(guildId, List()))))
+                            BotApp.huntedAlliedService.modifyHuntedPlayersData(m => m + (guildId -> (BotApp.Players(playerString, "false", "killed an allied player", BotApp.botUser) :: m.getOrElse(guildId, List()))))
                             // add them to the database
-                            BotApp.addHuntedToDatabase(guild, "player", playerString, "false", "killed an allied player", BotApp.botUser)
+                            BotApp.huntedAlliedService.addHuntedToDatabase(guild, "player", playerString, "false", "killed an allied player", BotApp.botUser)
                             // send embed to admin channel
                             val commandUser = s"<@${BotApp.botUser}>"
                             val adminEmbed = new EmbedBuilder()
@@ -923,7 +923,8 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
 
                     // nemesis and enemy fullbless ignore the level filter
                     if (embed._2 == "nemesis") {
-                      if (guild.getRoleById(nemesisRole) != null) {
+                      val shouldPing = guild.getRoleById(nemesisRole) != null && canPing(deathsTextChannel.getId)
+                      if (shouldPing) {
                         deathsTextChannel.sendMessage(s"<@&$nemesisRole>")
                           .setEmbeds(embed._1.build())
                           .queue()
@@ -931,7 +932,6 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
                         deathsTextChannel.sendMessageEmbeds(embed._1.build())
                           .queue()
                       }
-                      // WIP PVP COOLDOWN
                     } else if (embed._2 == "allypk") {
                       if (embed._5 >= minimumLevel) {
                         val shouldPing = guild.getRoleById(allyHelpRole) != null && canPing(deathsTextChannel.getId)
@@ -1428,7 +1428,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
             category.getManager.setName(s"$baseName$masslogIcon").queue()
           }
         } catch {
-          case ex: Throwable => logger.info(s"Failed to rename the category channel for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}': ${ex.getMessage}")
+          case ex: Throwable => logger.warn(s"Failed to rename the category channel for Guild ID: '${guild.getId}' Guild Name: '${guild.getName}'", ex)
         }
       }
     }
@@ -1447,7 +1447,7 @@ class TibiaBot(world: String)(implicit system: ActorSystem, ex: ExecutionContext
         try {
           channel.getManager.setName(targetName).queue()
         } catch {
-          case ex: Throwable => logger.info(s"Failed to rename the $label for Guild ID: '$guildId' Guild Name: '$guildName': ${ex.getMessage}")
+          case ex: Throwable => logger.warn(s"Failed to rename the $label for Guild ID: '$guildId' Guild Name: '$guildName'", ex)
         }
       }
     }

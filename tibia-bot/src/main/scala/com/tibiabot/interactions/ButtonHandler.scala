@@ -1,8 +1,8 @@
 package com.tibiabot.interactions
 
 import com.tibiabot.{BotApp, Config, presentation}
-import com.tibiabot.BotApp.worldsData
 import com.tibiabot.domain.{PendingScreenshot, SatchelStamp}
+import com.tibiabot.state.StreamState
 import com.tibiabot.domain.time.SatchelCooldown
 import com.typesafe.scalalogging.StrictLogging
 
@@ -21,7 +21,7 @@ import scala.collection.mutable
  *  role toggles). Moved verbatim from BotListener.onButtonInteraction; the
  *  shared pendingScreenshots map is passed in. */
 object ButtonHandler extends StrictLogging {
-  def handle(event: ButtonInteractionEvent, pendingScreenshots: mutable.Map[String, PendingScreenshot]): Unit = {
+  def handle(event: ButtonInteractionEvent, pendingScreenshots: mutable.Map[String, PendingScreenshot], streamState: StreamState): Unit = {
     val embed = event.getInteraction.getMessage.getEmbeds
     val title = if (!embed.isEmpty) embed.get(0).getTitle else ""
     val button = event.getComponentId
@@ -69,7 +69,7 @@ object ButtonHandler extends StrictLogging {
         Button.secondary("galthenLock", "🔒"),
         Button.danger("galthenRemoveAll", "Clear All").asDisabled
       )).queue();
-    } else if (button == "galthenRemind") { // WIP
+    } else if (button == "galthenRemind") {
       event.deferEdit().queue()
       val when = SatchelCooldown.expiresAtEpoch(ZonedDateTime.now())
       BotApp.galthenService.add(user.getId, ZonedDateTime.now(), tagId)
@@ -78,7 +78,7 @@ object ButtonHandler extends StrictLogging {
       event.getHook().editOriginalComponents().queue();
       val newEmbed = new EmbedBuilder().setDescription(responseText).setColor(178877).setFooter("You will be sent a message when the cooldown expires").build()
       event.getHook().editOriginalEmbeds(newEmbed).queue()
-    } else if (button == "galthenClear") { // WIP
+    } else if (button == "galthenClear") {
       event.deferEdit().queue()
       event.getHook().editOriginalComponents().queue()
     } else if (button == "galthenAdd") {
@@ -147,14 +147,12 @@ object ButtonHandler extends StrictLogging {
 
       val satchelTimeOption: Option[List[SatchelStamp]] = BotApp.galthenService.getStamps(event.getUser.getId)
       satchelTimeOption match {
-        //
         case Some(satchelTimeList) if satchelTimeList.isEmpty =>
           embed.setColor(presentation.Embeds.BrandColor)
           embed.setDescription(s"Mark the ${Config.satchelEmoji} as **Collected** and I will message you when the 30 day cooldown expires.")
           event.getHook.sendMessageEmbeds(embed.build()).addActionRow(
             Button.success("galthenSet", "Collected").withEmoji(Emoji.fromFormatted(Config.satchelEmoji))
           ).queue()
-        //
         case Some(satchelTimeList) =>
           val fullList = satchelTimeList.collect {
             case satchel =>
@@ -168,7 +166,7 @@ object ButtonHandler extends StrictLogging {
             embed.setColor(presentation.Embeds.BrandColor)
             if (fullList.size == 1){
               event.getHook.sendMessageEmbeds(embed.build()).addActionRow(
-                Button.success("galthenAdd", "Add Cooldown").withEmoji(Emoji.fromFormatted(Config.satchelEmoji)), //WIP
+                Button.success("galthenAdd", "Add Cooldown").withEmoji(Emoji.fromFormatted(Config.satchelEmoji)),
                 Button.danger("galthenRemoveAll", "Remove")
               ).queue()
             } else {
@@ -185,14 +183,12 @@ object ButtonHandler extends StrictLogging {
               Button.success("galthenSet", "Collected").withEmoji(Emoji.fromFormatted(Config.satchelEmoji))
             ).queue()
           }
-        // /HERE
         case None =>
           embed.setColor(presentation.Embeds.BrandColor)
           embed.setDescription(s"Mark the ${Config.satchelEmoji} as **Collected** and I will message you when the 30 day cooldown expires.")
           event.getHook.sendMessageEmbeds(embed.build()).addActionRow(
             Button.success("galthenSet", "Collected").withEmoji(Emoji.fromFormatted(Config.satchelEmoji))
           ).queue()
-        //
       }
     } else if (button == "fullbless") {
         event.deferReply(true).queue()
@@ -307,7 +303,7 @@ object ButtonHandler extends StrictLogging {
         val messageId = event.getInteraction.getMessage.getId
 
         // Get world from guild configuration
-        val worldOpt = worldsData.get(guild.getId).flatMap(_.headOption).map(_.name)
+        val worldOpt = streamState.worldsData.get(guild.getId).flatMap(_.headOption).map(_.name)
 
         worldOpt match {
           case Some(world) =>
@@ -372,7 +368,7 @@ object ButtonHandler extends StrictLogging {
         val currentIndex = buttonParts(5).toInt
 
         // Get world from guild configuration
-        val worldOpt = worldsData.get(guild.getId).flatMap(_.headOption).map(_.name)
+        val worldOpt = streamState.worldsData.get(guild.getId).flatMap(_.headOption).map(_.name)
 
         worldOpt.foreach { world =>
           val screenshots = BotApp.getDeathScreenshots(guild.getId, world, charName, deathTime)

@@ -39,7 +39,7 @@ object NeutralCommands {
                 event.getHook.sendMessageEmbeds(embed).queue()
               } else {
                 if (isValidEmoji(emojiOption)) {
-                  BotApp.addOnlineListCategory(event, typeOption, nameOption, labelOption, emojiOption, embed => {
+                  BotApp.customSortService.addOnlineListCategory(event, typeOption, nameOption, labelOption, emojiOption, embed => {
                     event.getHook.sendMessageEmbeds(embed).queue()
                   })
                 } else {
@@ -50,14 +50,14 @@ object NeutralCommands {
             case "remove" =>
               val typeOption: String = options.getOrElse("type", "")
               val nameOption: String = options.getOrElse("name", "").trim
-              val embed = BotApp.removeOnlineListCategory(event, typeOption, nameOption)
+              val embed = BotApp.customSortService.removeOnlineListCategory(event, typeOption, nameOption)
               event.getHook.sendMessageEmbeds(embed).queue()
             case "clear" =>
               val labelOption: String = sanitizeLabel(options.getOrElse("label", ""))
-              val embed = BotApp.clearOnlineListCategory(event, labelOption)
+              val embed = BotApp.customSortService.clearOnlineListCategory(event, labelOption)
               event.getHook.sendMessageEmbeds(embed).queue()
             case "list" =>
-              val embeds = BotApp.listOnlineListCategory(event)
+              val embeds = BotApp.customSortService.listOnlineListCategory(event)
               embeds.foreach { embed =>
                 event.getHook.sendMessageEmbeds(embed).setEphemeral(true).queue()
               }

@@ -1,7 +1,7 @@
 package com.tibiabot.commands.handlers
 
 import com.tibiabot.BotApp
-import com.tibiabot.BotApp.SatchelStamp
+import com.tibiabot.domain.SatchelStamp
 import com.tibiabot.domain.time.SatchelCooldown
 import com.tibiabot.presentation.GalthenEmbeds
 import net.dv8tion.jda.api.EmbedBuilder

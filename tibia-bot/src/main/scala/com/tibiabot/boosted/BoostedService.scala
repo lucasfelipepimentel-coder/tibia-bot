@@ -1,33 +1,68 @@
 package com.tibiabot.boosted
 
 import com.tibiabot.Config
-import com.tibiabot.domain.{BoostedStamp, BoostedName}
-import com.tibiabot.persistence.{BoostedRepository, ConnectionProvider}
+import com.tibiabot.domain.{BoostedCache, BoostedStamp, BoostedName}
+import com.tibiabot.persistence.{BoostedRepository, CacheRepository, ConnectionProvider}
 import com.tibiabot.presentation.{Urls, EmbedText}
+import com.tibiabot.tibiadata.TibiaApi
 import net.dv8tion.jda.api.EmbedBuilder
 import net.dv8tion.jda.api.entities.MessageEmbed
 
 import scala.collection.mutable.ListBuffer
+import scala.concurrent.{ExecutionContextExecutor, Future}
 
 /**
  * Per-user boosted boss/creature notification subscriptions
- * (the boosted_notifications table) and the /boosted command logic.
+ * (the boosted_notifications table), the /boosted command logic, and the
+ * "boosted boss/creature today" cache + embeds (the boosted_info table).
  * Moved verbatim from BotApp; name capitalisation is shared via
  * presentation.Names and the private creatureWikiUrl mirrors BotApp's.
  */
 final class BoostedService(
   connectionProvider: ConnectionProvider,
   boostedRepository: BoostedRepository,
+  cacheRepository: CacheRepository,
+  tibiaDataClient: TibiaApi,
   boostedBosses: () => List[String]
-) {
+)(implicit ex: ExecutionContextExecutor) {
 
   def boostedAll(): List[BoostedStamp] = boostedRepository.all()
 
   def boostedList(userId: String): Boolean =
     boostedRepository.forUser(userId).exists(bs => bs.user == userId && bs.boostedName.toLowerCase == "all")
 
+  private def creatureImageUrl(creature: String): String =
+    Urls.creatureImageUrl(creature, Config.creatureUrlMappings)
+
   private def creatureWikiUrl(creature: String): String =
     Urls.creatureWikiUrl(creature, Config.creatureUrlMappings)
+
+  def boostedMonsterUpdate(boss: String, creature: String, bossChanged: String, creatureChanged: String): Unit =
+    cacheRepository.updateBoosted(boss, creature, bossChanged, creatureChanged)
+
+  def boostedMessages(): List[BoostedCache] =
+    cacheRepository.getBoosted()
+
+  /** The "boosted boss today" embed (with a Podium fallback if the API fails).
+   *  Shared by the channel-setup and server-save-notification paths. */
+  def boostedBossEmbed(): Future[MessageEmbed] =
+    tibiaDataClient.getBoostedBoss().map {
+      case Right(boostedResponse) =>
+        val boostedBoss = boostedResponse.boostable_bosses.boosted.name
+        com.tibiabot.presentation.BoostedEmbeds.create(creatureImageUrl(boostedBoss), s"The boosted boss today is:\n### ${Config.indentEmoji}${Config.archfoeEmoji} **[$boostedBoss](${creatureWikiUrl(boostedBoss)})**")
+      case Left(_) =>
+        com.tibiabot.presentation.BoostedEmbeds.create(creatureImageUrl("Podium_of_Vigour"), "The boosted boss today failed to load?")
+    }
+
+  /** The "boosted creature today" embed (with a Podium fallback if the API fails). */
+  def boostedCreatureEmbed(): Future[MessageEmbed] =
+    tibiaDataClient.getBoostedCreature().map {
+      case Right(creatureResponse) =>
+        val boostedCreature = creatureResponse.creatures.boosted.name
+        com.tibiabot.presentation.BoostedEmbeds.create(creatureImageUrl(boostedCreature), s"The boosted creature today is:\n### ${Config.indentEmoji}${Config.levelUpEmoji} **[$boostedCreature](${creatureWikiUrl(boostedCreature)})**")
+      case Left(_) =>
+        com.tibiabot.presentation.BoostedEmbeds.create(creatureImageUrl("Podium_of_Tenacity"), "The boosted creature today failed to load?")
+    }
 
   // User-facing /boosted notification-list status messages, shared so the wording
   // stays consistent. They were duplicated inline ~6x and had already drifted: a
@@ -162,7 +197,6 @@ final class BoostedService(
                 val groupedAndSorted = renderBoostedEntries(newNames)
                 val listMessage = if (groupedAndSorted.trim != "") filterListMessage(groupedAndSorted) else allBoostedMessage
                 val commandMessage = s"${Config.yesEmoji} **$sanitizedName** was added."
-                //WIP
                 embedMessage = EmbedText.fit(listMessage, commandMessage)
               }
             }
@@ -210,7 +244,6 @@ final class BoostedService(
         val commandMessage = s"${Config.noEmoji} **$sanitizedName** is not on your list."
         embedMessage = EmbedText.fit(listMessage, commandMessage)
       }
-      //
     } else if (boostedOption == "toggle"){
       val existingSetting = existingNames.exists(bs => bs.user == userId && bs.boostedName.toLowerCase == "all")
       if (existingSetting) {
@@ -219,7 +252,6 @@ final class BoostedService(
         preparedStatement.setString(1, userId)
         preparedStatement.executeUpdate()
         preparedStatement.close()
-        // WIP Message
         embedMessage = emptyListMessage
       } else {
         val query = "INSERT INTO boosted_notifications (userid, name, type) VALUES (?, ?, ?) ON CONFLICT (userid, name) DO NOTHING"
@@ -231,7 +263,6 @@ final class BoostedService(
         preparedStatement.close()
         embedMessage = allBoostedMessage
       }
-      //
     } else if (boostedOption == "disable") {
       val query = "DELETE FROM boosted_notifications WHERE userid = ?"
       val preparedStatement = conn.prepareStatement(query)

@@ -12,14 +12,14 @@ import com.typesafe.scalalogging.StrictLogging
 import spray.json.JsonParser.ParsingException
 import java.net.URLEncoder
 import scala.util.Random
-import com.tibiabot.BotApp.{characterCache, modifyCharacterCache}
+import com.tibiabot.state.StreamState
 import scala.concurrent.{ExecutionContextExecutor, Future}
 import spray.json.DeserializationException
 import akka.http.scaladsl.model.headers.{Date => DateHeader}
 import java.time.{ZonedDateTime, ZoneId}
 import java.time.format.DateTimeFormatter
 
-class TibiaDataClient(implicit val system: ActorSystem) extends JsonSupport with StrictLogging with TibiaApi {
+class TibiaDataClient(streamState: StreamState)(implicit val system: ActorSystem) extends JsonSupport with StrictLogging with TibiaApi {
 
   implicit private val executionContext: ExecutionContextExecutor = system.dispatcher
 
@@ -152,15 +152,15 @@ class TibiaDataClient(implicit val system: ActorSystem) extends JsonSupport with
         case Some(dateHeader) =>
           val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss").withZone(ZoneId.of("GMT"))
           val responseDate = ZonedDateTime.parse(dateHeader.date.toString, formatter)
-          characterCache.get(name) match {
+          streamState.characterCache.get(name) match {
             case Some(existingDate) if responseDate.isAfter(existingDate) =>
-              modifyCharacterCache(_ + (name -> responseDate))
+              streamState.modifyCharacterCache(_ + (name -> responseDate))
               unmarshalCharacter(response, encodedName)
             case Some(_) =>
               response.discardEntityBytes()
               Future.successful(Left("Hit cache"))
             case None =>
-              modifyCharacterCache(_ + (name -> responseDate))
+              streamState.modifyCharacterCache(_ + (name -> responseDate))
               unmarshalCharacter(response, encodedName)
           }
         case None =>

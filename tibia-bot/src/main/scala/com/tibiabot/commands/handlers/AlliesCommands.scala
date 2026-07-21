@@ -24,14 +24,14 @@ object AlliesCommands {
         if (authed) {
           if (toggleOption == "add") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.addAlly(event, "player", nameOption, reasonOption, embed => {
+            BotApp.huntedAlliedService.addAlly(event, "player", nameOption, reasonOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
             })
           } else if (toggleOption == "remove") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.removeAlly(event, "player", nameOption, embed => {
+            BotApp.huntedAlliedService.removeAlly(event, "player", nameOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
@@ -45,14 +45,14 @@ object AlliesCommands {
         if (authed) {
           if (toggleOption == "add") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.addAlly(event, "guild", nameOption, reasonOption, embed => {
+            BotApp.huntedAlliedService.addAlly(event, "guild", nameOption, reasonOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
             })
           } else if (toggleOption == "remove") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.removeAlly(event, "guild", nameOption, embed => {
+            BotApp.huntedAlliedService.removeAlly(event, "guild", nameOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
@@ -64,12 +64,12 @@ object AlliesCommands {
         }
       case "list" =>
         if (authed) {
-          BotApp.listAlliesAndHuntedGuilds(event, "allies", allies => {
+          BotApp.huntedAlliedService.listAlliesAndHuntedGuilds(event, "allies", allies => {
             val embedsJava = allies.asJava
             embedsJava.forEach { embed =>
               event.getHook.sendMessageEmbeds(embed).setEphemeral(true).queue()
             }
-            BotApp.listAlliesAndHuntedPlayers(event, "allies", allies => {
+            BotApp.huntedAlliedService.listAlliesAndHuntedPlayers(event, "allies", allies => {
               val embedsJava = allies.asJava
               embedsJava.forEach { embed =>
                 event.getHook.sendMessageEmbeds(embed).setEphemeral(true).queue()
@@ -82,7 +82,7 @@ object AlliesCommands {
         }
       case "clear" =>
         if (authed) {
-          val embed = BotApp.clearAllies(event)
+          val embed = BotApp.huntedAlliedService.clearAllies(event)
           event.getHook.sendMessageEmbeds(embed).queue()
         } else {
            val embed = new EmbedBuilder().setDescription(s"${Config.noEmoji} You do not have permission to use this command.").build()
@@ -115,7 +115,7 @@ object AlliesCommands {
            event.getHook.sendMessageEmbeds(embed).queue()
         }
       case "info" =>
-        val embed = BotApp.infoAllies(event, "player", nameOption)
+        val embed = BotApp.huntedAlliedService.infoAllies(event, "player", nameOption)
         event.getHook.sendMessageEmbeds(embed).queue()
       case other =>
         val embed = new EmbedBuilder().setDescription(s"${Config.noEmoji} Invalid subcommand '$other' for `/allies`.").build()

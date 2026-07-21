@@ -1,6 +1,6 @@
 package com.tibiabot
 
-import com.tibiabot.BotApp.commands
+import com.tibiabot.commands.CommandSchemas.commands
 import net.dv8tion.jda.api.EmbedBuilder
 import net.dv8tion.jda.api.events.guild.GuildJoinEvent
 import net.dv8tion.jda.api.events.guild.GuildLeaveEvent
@@ -48,7 +48,7 @@ class BotListener extends ListenerAdapter with StrictLogging {
 
   override def onModalInteraction(event: ModalInteractionEvent): Unit = interactions.ModalHandler.handle(event)
 
-  override def onButtonInteraction(event: ButtonInteractionEvent): Unit = interactions.ButtonHandler.handle(event, pendingScreenshots)
+  override def onButtonInteraction(event: ButtonInteractionEvent): Unit = interactions.ButtonHandler.handle(event, pendingScreenshots, BotApp.streamState)
 
   override def onMessageReceived(event: MessageReceivedEvent): Unit = interactions.ScreenshotMessageHandler.onMessage(event, pendingScreenshots)
 }

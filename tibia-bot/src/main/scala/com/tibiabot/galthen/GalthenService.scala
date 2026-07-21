@@ -62,7 +62,7 @@ final class GalthenService(
             ).queue()
           }
         } catch {
-          case ex: Exception => //
+          case ex: Exception => logger.warn(s"Failed to send Galthen expiry DM to user: '$userId'", ex)
         }
       }
     }

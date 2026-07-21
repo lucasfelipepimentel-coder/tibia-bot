@@ -24,14 +24,14 @@ object HuntedCommands {
         if (authed) {
           if (toggleOption == "add") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.addHunted(event, "player", nameOption, reasonOption, embed => {
+            BotApp.huntedAlliedService.addHunted(event, "player", nameOption, reasonOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
             })
           } else if (toggleOption == "remove") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.removeHunted(event, "player", nameOption, embed => {
+            BotApp.huntedAlliedService.removeHunted(event, "player", nameOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
@@ -45,14 +45,14 @@ object HuntedCommands {
         if (authed) {
           if (toggleOption == "add") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.addHunted(event, "guild", nameOption, reasonOption, embed => {
+            BotApp.huntedAlliedService.addHunted(event, "guild", nameOption, reasonOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
             })
           } else if (toggleOption == "remove") {
             BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> true))
-            BotApp.removeHunted(event, "guild", nameOption, embed => {
+            BotApp.huntedAlliedService.removeHunted(event, "guild", nameOption, embed => {
               event.getHook.sendMessageEmbeds(embed).queue(_ => {
                 BotApp.modifyActivityCommandBlocker(_ + (event.getGuild.getId -> false))
               })
@@ -64,12 +64,12 @@ object HuntedCommands {
         }
       case "list" =>
         if (authed) {
-          BotApp.listAlliesAndHuntedGuilds(event, "hunted", hunteds => {
+          BotApp.huntedAlliedService.listAlliesAndHuntedGuilds(event, "hunted", hunteds => {
             val embedsJava = hunteds.asJava
             embedsJava.forEach { embed =>
               event.getHook.sendMessageEmbeds(embed).setEphemeral(true).queue()
             }
-            BotApp.listAlliesAndHuntedPlayers(event, "hunted", hunteds => {
+            BotApp.huntedAlliedService.listAlliesAndHuntedPlayers(event, "hunted", hunteds => {
               val embedsJava = hunteds.asJava
               embedsJava.forEach { embed =>
                 event.getHook.sendMessageEmbeds(embed).setEphemeral(true).queue()
@@ -82,7 +82,7 @@ object HuntedCommands {
         }
       case "clear" =>
         if (authed) {
-          val embed = BotApp.clearHunted(event)
+          val embed = BotApp.huntedAlliedService.clearHunted(event)
           event.getHook.sendMessageEmbeds(embed).queue()
         } else {
           val embed = new EmbedBuilder().setDescription(s"${Config.noEmoji} You do not have permission to use this command.").build()
@@ -115,7 +115,7 @@ object HuntedCommands {
            event.getHook.sendMessageEmbeds(embed).queue()
          }
       case "info" =>
-        val embed = BotApp.infoHunted(event, "player", nameOption)
+        val embed = BotApp.huntedAlliedService.infoHunted(event, "player", nameOption)
         event.getHook.sendMessageEmbeds(embed).queue()
       case "autodetect" =>
         if (authed) {
